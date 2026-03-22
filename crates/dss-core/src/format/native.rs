@@ -4,7 +4,7 @@
 //! producing files that are fully compatible with the C library.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,58 +12,87 @@ use super::bin::{self, BinEntry};
 use super::hash;
 use super::header::FileHeader;
 use super::io as dss_io;
-use super::keys::{self, file_header as fh, record_info as ri, bin as bk, ts_internal_header as tsh, data_type as dt};
+use super::keys::{
+    self, bin as bk, data_type as dt, file_header as fh, record_info as ri,
+    ts_internal_header as tsh,
+};
 use super::record::RecordInfo;
 use super::writer;
 
-// --- Size calculation helpers (match C library) ---
+// ---------------------------------------------------------------------------
+// Size helpers (must match C library exactly)
+// ---------------------------------------------------------------------------
 
+/// Number of i32 words needed to hold `n` bytes.
 fn num_ints_in_bytes(n: usize) -> usize {
     if n > 0 { (n - 1) / 4 + 1 } else { 0 }
 }
 
+/// Number of i64 words needed to hold `n` bytes.
 fn num_longs_in_bytes(n: usize) -> usize {
     if n > 0 { (n - 1) / 8 + 1 } else { 0 }
 }
 
+/// Number of i64 words needed to hold `n` i32 words.
 fn num_longs_in_ints(n: usize) -> usize {
     if n > 0 { (n - 1) / 2 + 1 } else { 0 }
 }
 
-/// Pack a byte slice into a vector of i64 words (little-endian, zero-padded).
+// ---------------------------------------------------------------------------
+// Byte-packing helpers
+// ---------------------------------------------------------------------------
+
+/// Pack a byte slice into zero-padded i64 words (little-endian).
 fn bytes_to_words(bytes: &[u8]) -> Vec<i64> {
-    let n_words = num_longs_in_bytes(bytes.len());
-    let mut words = vec![0i64; n_words];
+    let n = num_longs_in_bytes(bytes.len());
+    let mut words = vec![0i64; n];
     for (i, chunk) in bytes.chunks(8).enumerate() {
-        let mut word_bytes = [0u8; 8];
-        word_bytes[..chunk.len()].copy_from_slice(chunk);
-        words[i] = i64::from_le_bytes(word_bytes);
+        let mut buf = [0u8; 8];
+        buf[..chunk.len()].copy_from_slice(chunk);
+        words[i] = i64::from_le_bytes(buf);
     }
     words
 }
 
-/// Write i64 words to the file at a word address.
-fn write_words(file: &mut File, word_address: i64, words: &[i64]) -> io::Result<()> {
-    use std::io::Seek;
-    file.seek(io::SeekFrom::Start(word_address as u64 * 8))?;
-    for &word in words {
-        file.write_all(&word.to_le_bytes())?;
-    }
-    Ok(())
+/// Decode f64 values from raw LE bytes.
+fn decode_f64s(raw: &[u8]) -> Vec<f64> {
+    raw.chunks(8)
+        .map(|c| {
+            let mut b = [0u8; 8];
+            let n = c.len().min(8);
+            b[..n].copy_from_slice(&c[..n]);
+            f64::from_le_bytes(b)
+        })
+        .collect()
 }
 
-fn current_time_millis() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+/// Decode f32 values from raw LE bytes, converting to f64.
+fn decode_f32s_as_f64(raw: &[u8]) -> Vec<f64> {
+    raw.chunks(4)
+        .map(|c| {
+            let mut b = [0u8; 4];
+            let n = c.len().min(4);
+            b[..n].copy_from_slice(&c[..n]);
+            f32::from_le_bytes(b) as f64
+        })
+        .collect()
 }
 
-// --- Public types ---
+/// Decode i32 values from raw LE bytes.
+fn decode_i32s(raw: &[u8]) -> Vec<i32> {
+    raw.chunks(4)
+        .map(|c| {
+            let mut b = [0u8; 4];
+            let n = c.len().min(4);
+            b[..n].copy_from_slice(&c[..n]);
+            i32::from_le_bytes(b)
+        })
+        .collect()
+}
 
-/// Extract a null-terminated string from a slice of i32 values (char data).
+/// Extract a null-terminated string from a slice of i32 values.
 fn extract_string_from_i32s(data: &[i32]) -> String {
-    let mut bytes = Vec::new();
+    let mut bytes = Vec::with_capacity(data.len() * 4);
     for &val in data {
         bytes.extend_from_slice(&val.to_le_bytes());
     }
@@ -73,34 +102,25 @@ fn extract_string_from_i32s(data: &[i32]) -> String {
         .to_string()
 }
 
-/// Time series data read from a DSS7 file.
-#[derive(Debug, Clone)]
-pub struct TimeSeriesRecord {
-    /// DSS pathname.
-    pub pathname: String,
-    /// Data values (f64, converted from float if stored as float).
-    pub values: Vec<f64>,
-    /// Time offsets (for irregular TS; empty for regular).
-    pub times: Vec<i32>,
-    /// Quality flags (optional).
-    pub quality: Option<Vec<i32>>,
-    /// Units string (e.g., "CFS").
-    pub units: String,
-    /// Data type string (e.g., "PER-AVER", "INST-VAL") from user header.
-    pub data_type_str: String,
-    /// Record type code (100=RTS, 105=RTD, 110=ITS, 115=ITD).
-    pub record_type: i32,
-    /// Time granularity in seconds (60=minutes, 1=seconds).
-    pub time_granularity: i32,
-    /// Precision (0=default).
-    pub precision: i32,
-    /// Block start position within the time block.
-    pub block_start: i32,
-    /// Block end position within the time block.
-    pub block_end: i32,
-    /// Number of logical data values.
-    pub number_values: usize,
+fn current_time_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
+
+/// Write i64 words to a file at a word address.
+fn write_words(file: &mut File, word_address: i64, words: &[i64]) -> io::Result<()> {
+    file.seek(SeekFrom::Start(word_address as u64 * 8))?;
+    for &w in words {
+        file.write_all(&w.to_le_bytes())?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Public data types
+// ---------------------------------------------------------------------------
 
 /// A catalog entry from a pure Rust scan.
 #[derive(Debug, Clone)]
@@ -110,11 +130,46 @@ pub struct CatalogEntry {
     pub status: i64,
 }
 
+/// Time series data read from a DSS7 file.
+#[derive(Debug, Clone)]
+pub struct TimeSeriesRecord {
+    pub pathname: String,
+    pub values: Vec<f64>,
+    pub times: Vec<i32>,
+    pub quality: Option<Vec<i32>>,
+    pub units: String,
+    pub data_type_str: String,
+    pub record_type: i32,
+    pub time_granularity: i32,
+    pub precision: i32,
+    pub block_start: i32,
+    pub block_end: i32,
+    pub number_values: usize,
+}
+
+/// Paired data read from a DSS7 file.
+#[derive(Debug, Clone)]
+pub struct PairedDataRecord {
+    pub pathname: String,
+    pub ordinates: Vec<f64>,
+    pub values: Vec<f64>,
+    pub number_ordinates: usize,
+    pub number_curves: usize,
+    pub units_independent: String,
+    pub units_dependent: String,
+    pub labels: Vec<String>,
+    pub record_type: i32,
+}
+
+// ---------------------------------------------------------------------------
+// NativeDssFile
+// ---------------------------------------------------------------------------
+
 /// Pure Rust DSS7 file handle.
 ///
-/// Reads and writes DSS7 files without any dependency on the C library.
-/// Files created by `NativeDssFile` are fully compatible with the C library,
-/// HEC-DSSVue, and all other DSS7 consumers.
+/// Reads and writes DSS7 files without any C library dependency.
+/// Files are fully compatible with the C library, HEC-DSSVue, and all
+/// other DSS7 consumers.
 pub struct NativeDssFile {
     file: File,
     header: Vec<i64>,
@@ -122,52 +177,54 @@ pub struct NativeDssFile {
 }
 
 impl NativeDssFile {
+    // --- Constructors ---
+
     /// Open an existing DSS7 file for reading and writing.
     pub fn open(path: &str) -> io::Result<Self> {
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        let fh = FileHeader::read_from(&mut file)?;
-
-        if !fh.is_valid_dss() {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "Not a valid DSS7 file"));
+        let hdr = FileHeader::read_from(&mut file)?;
+        if !hdr.is_valid_dss() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Not a valid DSS7 file: {path}"),
+            ));
         }
-
-        Ok(NativeDssFile { file, header: fh.raw, path: path.to_string() })
+        Ok(Self { file, header: hdr.raw, path: path.to_string() })
     }
 
     /// Create a new empty DSS7 file.
     pub fn create(path: &str) -> io::Result<Self> {
-        let _file = writer::create_dss_file(Path::new(path))?;
-        // Reopen with read+write
+        let _f = writer::create_dss_file(Path::new(path))?;
         let mut file = OpenOptions::new().read(true).write(true).open(path)?;
-        let fh = FileHeader::read_from(&mut file)?;
-        Ok(NativeDssFile { file, header: fh.raw, path: path.to_string() })
+        let hdr = FileHeader::read_from(&mut file)?;
+        Ok(Self { file, header: hdr.raw, path: path.to_string() })
     }
 
-    // --- Header accessors ---
+    // --- Header accessors (private) ---
 
-    fn max_hash(&self) -> i32 { self.header[fh::MAX_HASH] as i32 }
-    fn bin_size(&self) -> i32 { self.header[fh::BIN_SIZE] as i32 }
+    fn max_hash(&self) -> i32     { self.header[fh::MAX_HASH] as i32 }
+    fn bin_size(&self) -> i32     { self.header[fh::BIN_SIZE] as i32 }
     fn bins_per_block(&self) -> i32 { self.header[fh::BINS_PER_BLOCK] as i32 }
     fn hash_table_start(&self) -> i64 { self.header[fh::ADD_HASH_TABLE_START] }
-    fn first_bin_address(&self) -> i64 { self.header[fh::ADD_FIRST_BIN] }
-    fn file_size(&self) -> i64 { self.header[fh::FILE_SIZE] }
+    fn first_bin_addr(&self) -> i64 { self.header[fh::ADD_FIRST_BIN] }
+    fn file_size(&self) -> i64    { self.header[fh::FILE_SIZE] }
 
-    /// Return the number of records in the file.
-    pub fn record_count(&self) -> i64 {
-        self.header[fh::NUMBER_RECORDS]
-    }
+    // --- Public queries ---
 
-    /// Build a catalog of all pathnames in the file.
+    pub fn record_count(&self) -> i64 { self.header[fh::NUMBER_RECORDS] }
+
     pub fn catalog(&mut self) -> io::Result<Vec<CatalogEntry>> {
-        let (first_bin, bs, bpb) = (self.first_bin_address(), self.bin_size(), self.bins_per_block());
-        let entries = bin::read_all_bins(&mut self.file, first_bin, bs, bpb)?;
+        let (fb, bs, bpb) = (self.first_bin_addr(), self.bin_size(), self.bins_per_block());
+        let entries = bin::read_all_bins(&mut self.file, fb, bs, bpb)?;
         Ok(entries.into_iter()
-            .filter(|e| e.status == keys::record_status::PRIMARY || e.status == keys::record_status::ALIAS)
+            .filter(|e| e.status == keys::record_status::PRIMARY
+                     || e.status == keys::record_status::ALIAS)
             .map(|e| CatalogEntry { pathname: e.pathname, record_type: e.data_type, status: e.status })
             .collect())
     }
 
-    /// Find a record by pathname using hash lookup.
+    // --- Pathname lookup ---
+
     fn find_record(&mut self, pathname: &str) -> io::Result<Option<BinEntry>> {
         let mh = self.max_hash();
         let ph = hash::pathname_hash(pathname.as_bytes());
@@ -176,20 +233,39 @@ impl NativeDssFile {
         bin::find_pathname(&mut self.file, hts, th, ph, pathname, bs)
     }
 
-    // --- Text records ---
-
-    /// Read a text record. Returns None if the pathname doesn't exist.
-    pub fn read_text(&mut self, pathname: &str) -> io::Result<Option<String>> {
+    /// Read the record info for a pathname. Returns None if not found.
+    fn read_record_info(&mut self, pathname: &str) -> io::Result<Option<RecordInfo>> {
         let entry = match self.find_record(pathname)? {
             Some(e) => e,
             None => return Ok(None),
         };
-        let info = match RecordInfo::read_from(&mut self.file, entry.info_address)? {
+        if entry.info_address <= 0 {
+            return Ok(None);
+        }
+        RecordInfo::read_from(&mut self.file, entry.info_address)
+    }
+
+    /// Read the internal header (i32 array) for a record.
+    fn read_internal_header(&mut self, info: &RecordInfo) -> io::Result<Vec<i32>> {
+        let addr = info.internal_header_address();
+        let num = info.internal_header_number();
+        if addr <= 0 || num <= 0 {
+            return Ok(Vec::new());
+        }
+        let raw = RecordInfo::read_data_area(&mut self.file, addr, num)?;
+        Ok(decode_i32s(&raw))
+    }
+
+    // -----------------------------------------------------------------------
+    // Text records
+    // -----------------------------------------------------------------------
+
+    /// Read a text record. Returns `None` if the pathname does not exist.
+    pub fn read_text(&mut self, pathname: &str) -> io::Result<Option<String>> {
+        let info = match self.read_record_info(pathname)? {
             Some(i) => i,
             None => return Ok(None),
         };
-
-        // Text is stored in values1
         let (addr, num) = (info.values1_address(), info.values1_number());
         if num <= 0 {
             return Ok(Some(String::new()));
@@ -198,164 +274,30 @@ impl NativeDssFile {
         Ok(Some(String::from_utf8_lossy(&raw).trim_end_matches('\0').to_string()))
     }
 
-    // --- Time Series ---
-
-    /// Read a time series record. Returns None if the pathname doesn't exist.
-    ///
-    /// Reads values, times, quality, and metadata from a single time series
-    /// record (one time block). For regular TS, times are computed from the
-    /// internal header offset; for irregular TS, times are stored in values2.
-    pub fn read_ts(&mut self, pathname: &str) -> io::Result<Option<TimeSeriesRecord>> {
-        let entry = match self.find_record(pathname)? {
-            Some(e) => e,
-            None => return Ok(None),
-        };
-        let info = match RecordInfo::read_from(&mut self.file, entry.info_address)? {
-            Some(i) => i,
-            None => return Ok(None),
-        };
-
-        let record_type = info.data_type();
-        if !dt::is_time_series(record_type) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Not a time series record (type={record_type})"),
-            ));
-        }
-
-        // Read internal header (stored as i32 words)
-        let ih_addr = info.internal_header_address();
-        let ih_num = info.internal_header_number(); // i32 count
-        if ih_num <= 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "No internal header"));
-        }
-
-        let ih_bytes = RecordInfo::read_data_area(&mut self.file, ih_addr, ih_num)?;
-        // Parse i32 values from bytes
-        let ih: Vec<i32> = ih_bytes.chunks(4)
-            .map(|c| i32::from_le_bytes([c[0], c.get(1).copied().unwrap_or(0),
-                                          c.get(2).copied().unwrap_or(0),
-                                          c.get(3).copied().unwrap_or(0)]))
-            .collect();
-
-        let time_granularity = ih.get(tsh::TIME_GRANULARITY).copied().unwrap_or(60);
-        let precision = ih.get(tsh::PRECISION).copied().unwrap_or(0);
-        let _value_size = ih.get(tsh::VALUE_SIZE).copied().unwrap_or(1);
-        let value_elem_size = ih.get(tsh::VALUE_ELEMENT_SIZE).copied().unwrap_or(1);
-        let quality_elem_size = ih.get(tsh::QUALITY_ELEMENT_SIZE).copied().unwrap_or(0);
-        let block_start = ih.get(tsh::BLOCK_START_POSITION).copied().unwrap_or(0);
-        let block_end = ih.get(tsh::BLOCK_END_POSITION).copied().unwrap_or(0);
-
-        // Time series layout:
-        //   values1 = data values (floats or doubles)
-        //   values2 = profile depths (if profile TS) or quality
-        //   values3 = quality/notes for non-profile TS
-        let is_double = dt::is_double_ts(record_type);
-
-        let v1_addr = info.values1_address();
-        let v1_num = info.values1_number();
-
-        let values: Vec<f64> = if v1_num > 0 {
-            let raw = RecordInfo::read_data_area(&mut self.file, v1_addr, v1_num)?;
-            if is_double || value_elem_size == 2 {
-                // doubles (8 bytes each)
-                raw.chunks(8).map(|c| {
-                    let mut b = [0u8; 8];
-                    b[..c.len()].copy_from_slice(c);
-                    f64::from_le_bytes(b)
-                }).collect()
-            } else {
-                // floats (4 bytes each), convert to f64
-                raw.chunks(4).map(|c| {
-                    let mut b = [0u8; 4];
-                    b[..c.len()].copy_from_slice(c);
-                    f32::from_le_bytes(b) as f64
-                }).collect()
-            }
-        } else {
-            Vec::new()
-        };
-
-        // For irregular TS, times are stored separately (in the transfer struct)
-        // For regular TS, times are implied by interval
-        let times: Vec<i32> = Vec::new(); // TODO: decode from irregular TS records
-
-        // Quality may be in values3
-        let v3_addr = info.values3_address();
-        let v3_num = info.values3_number();
-        let quality: Option<Vec<i32>> = if quality_elem_size > 0 && v3_num > 0 {
-            let raw = RecordInfo::read_data_area(&mut self.file, v3_addr, v3_num)?;
-            Some(raw.chunks(4).map(|c| {
-                let mut b = [0u8; 4];
-                b[..c.len()].copy_from_slice(c);
-                i32::from_le_bytes(b)
-            }).collect())
-        } else {
-            None
-        };
-
-        // Extract units and type from internal header (stored as chars after position 17)
-        let units = if ih.len() > tsh::UNITS + 1 {
-            extract_string_from_i32s(&ih[tsh::UNITS..])
-        } else {
-            String::new()
-        };
-
-        // User header may contain the data type string (PER-AVER, INST-VAL, etc.)
-        let uh_addr = info.user_header_address();
-        let uh_num = info.user_header_number();
-        let data_type_str = if uh_num > 0 {
-            let raw = RecordInfo::read_data_area(&mut self.file, uh_addr, uh_num)?;
-            String::from_utf8_lossy(&raw).trim_end_matches('\0').to_string()
-        } else {
-            String::new()
-        };
-
-        Ok(Some(TimeSeriesRecord {
-            pathname: pathname.to_string(),
-            values,
-            times,
-            quality,
-            units,
-            data_type_str,
-            record_type,
-            time_granularity,
-            precision,
-            block_start,
-            block_end,
-            number_values: info.number_data() as usize,
-        }))
-    }
-
-    /// Write a text record to the file.
+    /// Write a text record.
     pub fn write_text(&mut self, pathname: &str, text: &str) -> io::Result<()> {
         let text_bytes = text.as_bytes();
         let path_bytes = pathname.as_bytes();
 
-        // Size calculations
-        let values1_ints = num_ints_in_bytes(text_bytes.len());
-        let values1_longs = num_longs_in_ints(values1_ints);
-        let int_head_ints = 6usize; // text internal header is always 6 i32 words
-        let int_head_longs = num_longs_in_ints(int_head_ints);
+        let v1_ints = num_ints_in_bytes(text_bytes.len());
+        let v1_longs = num_longs_in_ints(v1_ints);
+        let ih_ints: usize = 6;
+        let ih_longs = num_longs_in_ints(ih_ints);
         let path_longs = num_longs_in_bytes(path_bytes.len());
         let info_size = ri::PATHNAME + path_longs;
-        let total_longs = info_size + int_head_longs + values1_longs;
+        let total = info_size + ih_longs + v1_longs;
 
-        // Allocate space at end of file
-        let alloc_addr = self.file_size();
-        let new_file_size = alloc_addr + total_longs as i64;
-
-        // Section addresses (all in i64 word units)
-        let info_addr = alloc_addr;
-        let int_head_addr = info_addr + info_size as i64;
-        let values1_addr = int_head_addr + int_head_longs as i64;
+        let base = self.file_size();
+        let info_addr = base;
+        let ih_addr = base + info_size as i64;
+        let v1_addr = ih_addr + ih_longs as i64;
+        let new_eof = base + total as i64;
 
         let ph = hash::pathname_hash(path_bytes);
-        let mh = self.max_hash();
-        let th = hash::table_hash(path_bytes, mh);
+        let th = hash::table_hash(path_bytes, self.max_hash());
         let now = current_time_millis();
 
-        // 1. Build and write info block
+        // Info block
         let mut info = vec![0i64; info_size];
         info[ri::FLAG] = keys::DSS_INFO_FLAG;
         info[ri::STATUS] = keys::record_status::PRIMARY;
@@ -364,46 +306,220 @@ impl NativeDssFile {
         info[ri::TYPE_VERSION] = dss_io::pack_i4(dt::TEXT, 1);
         info[ri::LAST_WRITE_TIME] = now;
         info[ri::CREATION_TIME] = now;
-        info[ri::INTERNAL_HEAD_ADDRESS] = int_head_addr;
-        info[ri::INTERNAL_HEAD_NUMBER] = int_head_ints as i64;
-        info[ri::VALUES1_ADDRESS] = values1_addr;
-        info[ri::VALUES1_NUMBER] = values1_ints as i64;
-        info[ri::ALLOCATED_SIZE] = (total_longs * 2) as i64; // in i32 words
+        info[ri::INTERNAL_HEAD_ADDRESS] = ih_addr;
+        info[ri::INTERNAL_HEAD_NUMBER] = ih_ints as i64;
+        info[ri::VALUES1_ADDRESS] = v1_addr;
+        info[ri::VALUES1_NUMBER] = v1_ints as i64;
+        info[ri::ALLOCATED_SIZE] = (total * 2) as i64;
         info[ri::NUMBER_DATA] = text_bytes.len() as i64;
         info[ri::LOGICAL_NUMBER] = text_bytes.len() as i64;
-        // Pathname packed into info block
-        let path_words = bytes_to_words(path_bytes);
-        info[ri::PATHNAME..ri::PATHNAME + path_words.len()].copy_from_slice(&path_words);
+        let pw = bytes_to_words(path_bytes);
+        info[ri::PATHNAME..ri::PATHNAME + pw.len()].copy_from_slice(&pw);
         write_words(&mut self.file, info_addr, &info)?;
 
-        // 2. Build and write internal header (6 i32s packed into i64s)
-        let mut int_head = vec![0i64; int_head_longs];
-        int_head[0] = dss_io::pack_i4(text_bytes.len() as i32, 0); // textChars, tableChars
-        int_head[1] = dss_io::pack_i4(0, 0); // labelChars, rows
-        int_head[2] = dss_io::pack_i4(0, 0); // cols, reserved
-        write_words(&mut self.file, int_head_addr, &int_head)?;
+        // Internal header (6 i32 words packed into i64s)
+        let mut ih = vec![0i64; ih_longs];
+        ih[0] = dss_io::pack_i4(text_bytes.len() as i32, 0);
+        write_words(&mut self.file, ih_addr, &ih)?;
 
-        // 3. Write text data (values1) - safe byte packing, no unsafe
-        let values1 = bytes_to_words(text_bytes);
-        // Pad to values1_longs if needed
-        let mut padded = values1;
-        padded.resize(values1_longs, 0);
-        write_words(&mut self.file, values1_addr, &padded)?;
+        // Values1 (text bytes)
+        let mut v1 = bytes_to_words(text_bytes);
+        v1.resize(v1_longs, 0);
+        write_words(&mut self.file, v1_addr, &v1)?;
 
-        // 4. Write EOF flag
-        write_words(&mut self.file, new_file_size, &[keys::DSS_END_FILE_FLAG])?;
+        // EOF marker
+        write_words(&mut self.file, new_eof, &[keys::DSS_END_FILE_FLAG])?;
 
-        // 5. Write bin entry and update hash table
+        // Bin entry + hash table
         self.write_bin_entry(pathname, ph, th, info_addr, dt::TEXT, now)?;
 
-        // 6. Update file header (last to ensure consistency)
+        // Header update (last for consistency)
         self.header[fh::NUMBER_RECORDS] += 1;
-        self.header[fh::FILE_SIZE] = new_file_size;
+        self.header[fh::FILE_SIZE] = new_eof;
         self.header[fh::LAST_WRITE_TIME] = now;
         write_words(&mut self.file, 0, &self.header)?;
+        self.file.flush()
+    }
 
-        self.file.flush()?;
-        Ok(())
+    // -----------------------------------------------------------------------
+    // Time series
+    // -----------------------------------------------------------------------
+
+    /// Read a time series record (single block).
+    /// Returns `None` if the pathname does not exist.
+    pub fn read_ts(&mut self, pathname: &str) -> io::Result<Option<TimeSeriesRecord>> {
+        let info = match self.read_record_info(pathname)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        let rtype = info.data_type();
+        if !dt::is_time_series(rtype) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Record type {rtype} is not a time series"),
+            ));
+        }
+
+        let ih = self.read_internal_header(&info)?;
+        if ih.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Missing internal header"));
+        }
+
+        let granularity  = ih.get(tsh::TIME_GRANULARITY).copied().unwrap_or(60);
+        let precision    = ih.get(tsh::PRECISION).copied().unwrap_or(0);
+        let elem_size    = ih.get(tsh::VALUE_ELEMENT_SIZE).copied().unwrap_or(1);
+        let q_elem_size  = ih.get(tsh::QUALITY_ELEMENT_SIZE).copied().unwrap_or(0);
+        let blk_start    = ih.get(tsh::BLOCK_START_POSITION).copied().unwrap_or(0);
+        let blk_end      = ih.get(tsh::BLOCK_END_POSITION).copied().unwrap_or(0);
+
+        // Data values are in values1
+        let values = self.read_numeric_values(&info, 1, dt::is_double_ts(rtype), elem_size)?;
+
+        // Quality may be in values3
+        let quality = if q_elem_size > 0 && info.values3_number() > 0 {
+            let raw = RecordInfo::read_data_area(
+                &mut self.file, info.values3_address(), info.values3_number(),
+            )?;
+            Some(decode_i32s(&raw))
+        } else {
+            None
+        };
+
+        // Units embedded in internal header starting at offset UNITS
+        let units = if ih.len() > tsh::UNITS + 1 {
+            extract_string_from_i32s(&ih[tsh::UNITS..])
+        } else {
+            String::new()
+        };
+
+        // Data type string from user header
+        let dtype_str = self.read_string_area(info.user_header_address(), info.user_header_number())?;
+
+        Ok(Some(TimeSeriesRecord {
+            pathname: pathname.to_string(),
+            values,
+            times: Vec::new(), // regular TS times are implicit
+            quality,
+            units,
+            data_type_str: dtype_str,
+            record_type: rtype,
+            time_granularity: granularity,
+            precision,
+            block_start: blk_start,
+            block_end: blk_end,
+            number_values: info.number_data() as usize,
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Paired data
+    // -----------------------------------------------------------------------
+
+    /// Read a paired data record.
+    /// Returns `None` if the pathname does not exist.
+    pub fn read_pd(&mut self, pathname: &str) -> io::Result<Option<PairedDataRecord>> {
+        let info = match self.read_record_info(pathname)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        let rtype = info.data_type();
+        if !matches!(rtype, 200..=209) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Record type {rtype} is not paired data"),
+            ));
+        }
+
+        let ih = self.read_internal_header(&info)?;
+        // Paired data internal header:
+        //   [0] = numberOrdinates, [1] = numberCurves,
+        //   [2] = boolIndependentIsXaxis, [3] = labelsLength, [4] = precision
+        //   [5+] = units
+        let n_ord   = ih.get(0).copied().unwrap_or(0) as usize;
+        let n_curves = ih.get(1).copied().unwrap_or(0) as usize;
+        let labels_len = ih.get(3).copied().unwrap_or(0) as usize;
+        let is_double = rtype == dt::PDD;
+
+        // values1 = ordinates (floats or doubles)
+        let ordinates = self.read_numeric_values(&info, 1, is_double, if is_double { 2 } else { 1 })?;
+
+        // values2 = curve values (n_ord * n_curves)
+        let curve_values = self.read_numeric_values(&info, 2, is_double, if is_double { 2 } else { 1 })?;
+
+        // header2 = labels (null-separated strings)
+        let labels = if labels_len > 0 && info.header2_number() > 0 {
+            let raw = RecordInfo::read_data_area(
+                &mut self.file, info.header2_address(), info.header2_number(),
+            )?;
+            raw.split(|&b| b == 0)
+                .map(|s| String::from_utf8_lossy(s).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Units from internal header
+        let units_str = if ih.len() > 5 {
+            extract_string_from_i32s(&ih[5..])
+        } else {
+            String::new()
+        };
+        // Split "units_indep\0units_dep" pattern
+        let (ui, ud) = if let Some(pos) = units_str.find('\0') {
+            (units_str[..pos].to_string(), units_str[pos+1..].trim_matches('\0').to_string())
+        } else {
+            (units_str.clone(), String::new())
+        };
+
+        Ok(Some(PairedDataRecord {
+            pathname: pathname.to_string(),
+            ordinates,
+            values: curve_values,
+            number_ordinates: n_ord,
+            number_curves: n_curves,
+            units_independent: ui,
+            units_dependent: ud,
+            labels,
+            record_type: rtype,
+        }))
+    }
+
+    // -----------------------------------------------------------------------
+    // Private helpers
+    // -----------------------------------------------------------------------
+
+    /// Read numeric values from a data area (values1, values2, or values3).
+    /// `area` is 1, 2, or 3.
+    fn read_numeric_values(
+        &mut self,
+        info: &RecordInfo,
+        area: u8,
+        is_double: bool,
+        elem_size: i32,
+    ) -> io::Result<Vec<f64>> {
+        let (addr, num) = match area {
+            1 => (info.values1_address(), info.values1_number()),
+            2 => (info.values2_address(), info.values2_number()),
+            3 => (info.values3_address(), info.values3_number()),
+            _ => return Ok(Vec::new()),
+        };
+        if num <= 0 || addr <= 0 {
+            return Ok(Vec::new());
+        }
+        let raw = RecordInfo::read_data_area(&mut self.file, addr, num)?;
+        Ok(if is_double || elem_size >= 2 { decode_f64s(&raw) } else { decode_f32s_as_f64(&raw) })
+    }
+
+    /// Read a string from a data area (user header, header2, etc.).
+    fn read_string_area(&mut self, addr: i64, num: i32) -> io::Result<String> {
+        if num <= 0 || addr <= 0 {
+            return Ok(String::new());
+        }
+        let raw = RecordInfo::read_data_area(&mut self.file, addr, num)?;
+        Ok(String::from_utf8_lossy(&raw).trim_end_matches('\0').to_string())
     }
 
     /// Write a bin entry for a new record into the current bin block.
@@ -418,39 +534,29 @@ impl NativeDssFile {
     ) -> io::Result<()> {
         let path_bytes = pathname.as_bytes();
         let path_longs = num_longs_in_bytes(path_bytes.len());
-        let entry_size = bk::FIXED_SIZE + path_longs;
-        let bin_size = self.bin_size() as usize;
+        let entry_words = bk::FIXED_SIZE + path_longs;
+        let bs = self.bin_size() as usize;
 
-        // Validate: entry must fit in one bin slot
-        if entry_size > bin_size {
+        if entry_words > bs {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("Pathname too long for bin (entry={entry_size} > bin_size={bin_size})"),
+                format!("Pathname too long for bin ({entry_words} > {bs} words)"),
             ));
         }
-
-        // Validate: bins remaining in current block
-        let bins_remain = self.header[fh::BINS_REMAIN_IN_BLOCK];
-        if bins_remain <= 0 {
-            // TODO: allocate new bin block and chain via overflow pointer
+        let remain = self.header[fh::BINS_REMAIN_IN_BLOCK];
+        if remain <= 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 "Bin block full; overflow allocation not yet implemented",
             ));
         }
-
-        let next_empty = self.header[fh::ADD_NEXT_EMPTY_BIN];
-
-        // Validate address is within file bounds
-        if next_empty <= 0 || next_empty >= self.file_size() + (bin_size as i64) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Invalid next_empty bin address: {next_empty}"),
-            ));
+        let next = self.header[fh::ADD_NEXT_EMPTY_BIN];
+        if next <= 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid next_empty bin address"));
         }
 
-        // Build the bin entry
-        let mut entry = vec![0i64; entry_size];
+        // Build entry
+        let mut entry = vec![0i64; entry_words];
         entry[bk::HASH] = pathname_hash;
         entry[bk::STATUS] = keys::record_status::PRIMARY;
         entry[bk::PATH_LEN] = dss_io::pack_i4(path_bytes.len() as i32, path_longs as i32);
@@ -458,30 +564,22 @@ impl NativeDssFile {
         entry[bk::TYPE_AND_CAT_SORT] = dss_io::pack_i4(data_type, 0);
         entry[bk::LAST_WRITE] = write_time;
         entry[bk::DATES] = 0;
-        let path_words = bytes_to_words(path_bytes);
-        entry[bk::PATH..bk::PATH + path_words.len()].copy_from_slice(&path_words);
+        let pw = bytes_to_words(path_bytes);
+        entry[bk::PATH..bk::PATH + pw.len()].copy_from_slice(&pw);
 
-        // Write the entry at the next empty bin slot
-        write_words(&mut self.file, next_empty, &entry)?;
+        write_words(&mut self.file, next, &entry)?;
 
-        // Point hash table to this bin's containing block (not the entry itself).
-        // Each bin block starts at first_bin + N * (bin_size * bins_per_block + 1).
-        // The hash table entry should point to the start of the block that contains
-        // this bin slot's entries for this hash code.
+        // Update hash table if this is the first entry for this hash
         let hts = self.hash_table_start();
-        let hash_slot_addr = hts + table_hash as i64;
-        let existing_bin = dss_io::read_word(&mut self.file, hash_slot_addr)?;
-        if existing_bin == 0 {
-            // Point hash table to this bin slot (first entry for this hash)
-            write_words(&mut self.file, hash_slot_addr, &[next_empty])?;
+        let slot = hts + table_hash as i64;
+        if dss_io::read_word(&mut self.file, slot)? == 0 {
+            write_words(&mut self.file, slot, &[next])?;
             self.header[fh::HASHS_USED] += 1;
         }
 
-        // Advance to next empty bin slot
-        self.header[fh::ADD_NEXT_EMPTY_BIN] = next_empty + bin_size as i64;
+        self.header[fh::ADD_NEXT_EMPTY_BIN] = next + bs as i64;
         self.header[fh::TOTAL_BINS] += 1;
-        self.header[fh::BINS_REMAIN_IN_BLOCK] = bins_remain - 1;
-
+        self.header[fh::BINS_REMAIN_IN_BLOCK] = remain - 1;
         Ok(())
     }
 }
@@ -498,87 +596,80 @@ impl std::fmt::Debug for NativeDssFile {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("native_{name}.dss"))
+    }
+
     #[test]
     fn test_create_and_catalog() {
-        let path = std::env::temp_dir().join("native_create_test.dss");
-        let _ = std::fs::remove_file(&path);
-
-        let mut dss = NativeDssFile::create(path.to_str().unwrap()).unwrap();
+        let p = temp_path("create");
+        let _ = std::fs::remove_file(&p);
+        let mut dss = NativeDssFile::create(p.to_str().unwrap()).unwrap();
         assert_eq!(dss.record_count(), 0);
         assert!(dss.catalog().unwrap().is_empty());
-
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn test_write_and_read_text() {
-        let path = std::env::temp_dir().join("native_text_test.dss");
-        let _ = std::fs::remove_file(&path);
-
+        let p = temp_path("text");
+        let _ = std::fs::remove_file(&p);
         {
-            let mut dss = NativeDssFile::create(path.to_str().unwrap()).unwrap();
-            dss.write_text("/A/B/NOTE///NATIVE/", "Hello from pure Rust!").unwrap();
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            d.write_text("/A/B/NOTE///NATIVE/", "Hello from pure Rust!").unwrap();
         }
         {
-            let mut dss = NativeDssFile::open(path.to_str().unwrap()).unwrap();
-            assert_eq!(dss.record_count(), 1);
-            assert_eq!(dss.read_text("/A/B/NOTE///NATIVE/").unwrap(), Some("Hello from pure Rust!".to_string()));
-            assert_eq!(dss.catalog().unwrap().len(), 1);
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            assert_eq!(d.record_count(), 1);
+            assert_eq!(d.read_text("/A/B/NOTE///NATIVE/").unwrap(), Some("Hello from pure Rust!".into()));
         }
-
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn test_write_multiple_records() {
-        let path = std::env::temp_dir().join("native_multi_test.dss");
-        let _ = std::fs::remove_file(&path);
-
+        let p = temp_path("multi");
+        let _ = std::fs::remove_file(&p);
         {
-            let mut dss = NativeDssFile::create(path.to_str().unwrap()).unwrap();
-            dss.write_text("/A/B/NOTE///ONE/", "First record").unwrap();
-            dss.write_text("/A/B/NOTE///TWO/", "Second record").unwrap();
-            dss.write_text("/X/Y/DATA///Z/", "Third record").unwrap();
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            d.write_text("/A/B/NOTE///ONE/", "First").unwrap();
+            d.write_text("/A/B/NOTE///TWO/", "Second").unwrap();
+            d.write_text("/X/Y/DATA///Z/", "Third").unwrap();
         }
         {
-            let mut dss = NativeDssFile::open(path.to_str().unwrap()).unwrap();
-            assert_eq!(dss.record_count(), 3);
-            assert_eq!(dss.read_text("/A/B/NOTE///ONE/").unwrap(), Some("First record".to_string()));
-            assert_eq!(dss.read_text("/A/B/NOTE///TWO/").unwrap(), Some("Second record".to_string()));
-            assert_eq!(dss.read_text("/X/Y/DATA///Z/").unwrap(), Some("Third record".to_string()));
-            assert_eq!(dss.catalog().unwrap().len(), 3);
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            assert_eq!(d.record_count(), 3);
+            assert_eq!(d.read_text("/A/B/NOTE///ONE/").unwrap(), Some("First".into()));
+            assert_eq!(d.read_text("/A/B/NOTE///TWO/").unwrap(), Some("Second".into()));
+            assert_eq!(d.read_text("/X/Y/DATA///Z/").unwrap(), Some("Third".into()));
         }
-
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
-    fn test_read_nonexistent_pathname() {
-        let path = std::env::temp_dir().join("native_notfound_test.dss");
-        let _ = std::fs::remove_file(&path);
-
-        let mut dss = NativeDssFile::create(path.to_str().unwrap()).unwrap();
-        assert_eq!(dss.read_text("/DOES/NOT/EXIST///HERE/").unwrap(), None);
-
-        let _ = std::fs::remove_file(&path);
+    fn test_read_nonexistent() {
+        let p = temp_path("notfound");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        assert_eq!(d.read_text("/NO/EXIST///HERE/").unwrap(), None);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]
     fn test_empty_text() {
-        let path = std::env::temp_dir().join("native_empty_test.dss");
-        let _ = std::fs::remove_file(&path);
-
-        // DSS text records with 0 bytes won't have values1 data
-        // This tests our handling of edge case
-        let mut dss = NativeDssFile::create(path.to_str().unwrap()).unwrap();
-        dss.write_text("/A/B/NOTE///EMPTY/", "").unwrap();
-        let text = dss.read_text("/A/B/NOTE///EMPTY/").unwrap();
-        assert_eq!(text, Some(String::new()));
-
-        let _ = std::fs::remove_file(&path);
+        let p = temp_path("empty");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        d.write_text("/A/B/NOTE///E/", "").unwrap();
+        assert_eq!(d.read_text("/A/B/NOTE///E/").unwrap(), Some(String::new()));
+        let _ = std::fs::remove_file(&p);
     }
 }

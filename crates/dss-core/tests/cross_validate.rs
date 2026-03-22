@@ -391,6 +391,67 @@ fn test_c_writes_ts_rust_reads() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Write paired data via C, then read via pure Rust NativeDssFile.
+#[test]
+fn test_c_writes_pd_rust_reads() {
+    use dss_core::NativeDssFile;
+
+    let path = std::env::temp_dir().join("cross_validate_pd_read.dss");
+    let _ = std::fs::remove_file(&path);
+    let c_path = CString::new(path.to_str().unwrap()).unwrap();
+
+    // Write PD via C
+    unsafe {
+        use dss_sys::*;
+        let mut dss: *mut dss_file = std::ptr::null_mut();
+        hec_dss_open(c_path.as_ptr(), &mut dss);
+
+        let pathname = CString::new("/BASIN/LOC/FREQ-FLOW///COMPUTED/").unwrap();
+        let mut ordinates = [1.0f64, 5.0, 10.0, 50.0, 100.0];
+        let mut values = [500.0f64, 1000.0, 2000.0, 5000.0, 10000.0];
+        let ui = CString::new("PERCENT").unwrap();
+        let ti = CString::new("FREQ").unwrap();
+        let ud = CString::new("CFS").unwrap();
+        let td = CString::new("FLOW").unwrap();
+        let tz = CString::new("").unwrap();
+
+        let status = hec_dss_pdStore(
+            dss, pathname.as_ptr(),
+            ordinates.as_mut_ptr(), 5,
+            values.as_mut_ptr(), 5,
+            5, 1,
+            ui.as_ptr(), ti.as_ptr(), ud.as_ptr(), td.as_ptr(),
+            std::ptr::null(), 0,
+            tz.as_ptr(),
+        );
+        assert_eq!(status, 0, "C pdStore failed");
+        hec_dss_close(dss);
+    }
+
+    // Read via pure Rust
+    let mut dss = NativeDssFile::open(path.to_str().unwrap()).unwrap();
+    let cat = dss.catalog().unwrap();
+    assert!(!cat.is_empty());
+
+    let pd = dss.read_pd(&cat[0].pathname).unwrap();
+    assert!(pd.is_some(), "Should read paired data");
+    let pd = pd.unwrap();
+
+    println!("PD: n_ord={}, n_curves={}, ordinates={:?}",
+        pd.number_ordinates, pd.number_curves, pd.ordinates);
+    println!("Values: {:?}", pd.values);
+
+    assert_eq!(pd.number_ordinates, 5);
+    assert_eq!(pd.number_curves, 1);
+    assert!((pd.ordinates[0] - 1.0).abs() < 0.001);
+    assert!((pd.ordinates[4] - 100.0).abs() < 0.001);
+    assert!((pd.values[0] - 500.0).abs() < 0.001);
+    assert!((pd.values[4] - 10000.0).abs() < 0.001);
+
+    println!("C writes PD -> pure Rust reads = SUCCESS");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Write text records in pure Rust, then verify the C library can read them.
 #[test]
 fn test_rust_writes_text_c_reads() {
