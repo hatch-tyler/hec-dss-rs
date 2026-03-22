@@ -10,3 +10,5 @@ pub mod pathname;
 pub mod io;
 pub mod bin;
 pub mod record;
+pub mod locking;
+pub mod writer;

@@ -5,6 +5,7 @@ use dss_core::format::header::FileHeader;
 use dss_core::format::bin;
 use dss_core::format::record::RecordInfo;
 use dss_core::format::io as dss_io;
+use dss_core::format::writer;
 use std::ffi::CString;
 use std::fs::File;
 
@@ -323,6 +324,92 @@ fn test_read_text_data_pure_rust() {
         text.contains(expected_text),
         "Expected to find '{expected_text}' in '{text}'"
     );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Create a DSS7 file in pure Rust, then verify the C library can open it,
+/// write to it, and the data can be read back in pure Rust.
+#[test]
+fn test_rust_created_file_readable_by_c() {
+    let path = std::env::temp_dir().join("cross_validate_rust_create.dss");
+    let _ = std::fs::remove_file(&path);
+
+    // Create in pure Rust
+    {
+        let _file = writer::create_dss_file(&path).unwrap();
+    }
+
+    // Verify with C library
+    let c_path = CString::new(path.to_str().unwrap()).unwrap();
+    unsafe {
+        use dss_sys::*;
+
+        // Check file version
+        let version = hec_dss_getFileVersion(c_path.as_ptr());
+        println!("C library reports file version: {version}");
+        assert_eq!(version, 7, "C library should recognize as DSS7");
+
+        // Open it
+        let mut dss: *mut dss_file = std::ptr::null_mut();
+        let status = hec_dss_open(c_path.as_ptr(), &mut dss);
+        println!("C library open status: {status}");
+        assert_eq!(status, 0, "C library should open Rust-created file");
+        assert!(!dss.is_null());
+
+        // Verify version and empty record count
+        let v = hec_dss_getVersion(dss);
+        assert_eq!(v, 7);
+
+        let count = hec_dss_record_count(dss);
+        assert_eq!(count, 0, "New file should have 0 records");
+
+        // Write a text record via C into the Rust-created file
+        let pn = CString::new("/RUST/CREATED/NOTE///TEST/").unwrap();
+        let text = CString::new("Written by C into Rust file").unwrap();
+        let store_status = hec_dss_textStore(dss, pn.as_ptr(), text.as_ptr(), 27);
+        println!("C library text store status: {store_status}");
+        assert_eq!(store_status, 0, "C should write to Rust-created file");
+
+        // Read it back via C
+        let mut buf = [0i8; 256];
+        let read_status = hec_dss_textRetrieve(
+            dss, pn.as_ptr(), buf.as_mut_ptr() as *mut std::os::raw::c_char, 256
+        );
+        assert_eq!(read_status, 0);
+        let result = std::ffi::CStr::from_ptr(buf.as_ptr() as *const std::os::raw::c_char)
+            .to_str().unwrap();
+        assert_eq!(result, "Written by C into Rust file");
+
+        assert_eq!(hec_dss_record_count(dss), 1);
+        hec_dss_close(dss);
+    }
+
+    // Read the C-written data back in pure Rust
+    let mut file = File::open(&path).unwrap();
+    let header = FileHeader::read_from(&mut file).unwrap();
+    assert!(header.is_valid_dss());
+    assert_eq!(header.number_records(), 1);
+
+    let target = "/RUST/CREATED/NOTE///TEST/";
+    let th = hash::table_hash(target.as_bytes(), header.max_hash());
+    let ph = hash::pathname_hash(target.as_bytes());
+
+    let entry = bin::find_pathname(
+        &mut file, header.hash_table_start(), th, ph, target, header.bin_size(),
+    ).unwrap().expect("Should find C-written record in Rust-created file");
+
+    let info = RecordInfo::read_from(&mut file, entry.info_address)
+        .unwrap().expect("Should read info");
+    assert_eq!(info.data_type(), 300);
+
+    let data_addr = if info.values1_number() > 0 { info.values1_address() } else { info.values3_address() };
+    let data_num = if info.values1_number() > 0 { info.values1_number() } else { info.values3_number() };
+    let raw = RecordInfo::read_data_area(&mut file, data_addr, data_num).unwrap();
+    let text = String::from_utf8_lossy(&raw).trim_end_matches('\0').to_string();
+    assert_eq!(text, "Written by C into Rust file");
+
+    println!("Full round-trip: Rust create -> C write -> Rust read = SUCCESS");
 
     let _ = std::fs::remove_file(&path);
 }

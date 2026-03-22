@@ -8,3 +8,4 @@ license.workspace = true
 [dependencies]
 dss-sys = { path = "../dss-sys" }
 thiserror = "2"
+fs2 = "0.4"
