@@ -328,6 +328,62 @@ fn test_read_text_data_pure_rust() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Write text records in pure Rust, then verify the C library can read them.
+#[test]
+fn test_rust_writes_text_c_reads() {
+    use dss_core::NativeDssFile;
+
+    let path = std::env::temp_dir().join("cross_validate_rust_writes_text.dss");
+    let _ = std::fs::remove_file(&path);
+
+    // Write in pure Rust
+    {
+        let mut dss = NativeDssFile::create(path.to_str().unwrap()).unwrap();
+        dss.write_text("/RUST/WROTE/NOTE///THIS/", "Written entirely by Rust").unwrap();
+        dss.write_text("/RUST/WROTE/DATA///ALSO/", "Second record from Rust").unwrap();
+    }
+
+    // Read with C library
+    let c_path = CString::new(path.to_str().unwrap()).unwrap();
+    unsafe {
+        use dss_sys::*;
+
+        let mut dss: *mut dss_file = std::ptr::null_mut();
+        let status = hec_dss_open(c_path.as_ptr(), &mut dss);
+        assert_eq!(status, 0, "C should open Rust-written file");
+
+        let count = hec_dss_record_count(dss);
+        assert_eq!(count, 2, "C should see 2 records");
+
+        // Read first text record
+        let pn1 = CString::new("/RUST/WROTE/NOTE///THIS/").unwrap();
+        let mut buf1 = [0i8; 256];
+        let s1 = hec_dss_textRetrieve(
+            dss, pn1.as_ptr(), buf1.as_mut_ptr() as *mut std::os::raw::c_char, 256
+        );
+        assert_eq!(s1, 0, "C should read first Rust-written record");
+        let text1 = std::ffi::CStr::from_ptr(buf1.as_ptr() as *const std::os::raw::c_char)
+            .to_str().unwrap();
+        assert_eq!(text1, "Written entirely by Rust");
+
+        // Read second text record
+        let pn2 = CString::new("/RUST/WROTE/DATA///ALSO/").unwrap();
+        let mut buf2 = [0i8; 256];
+        let s2 = hec_dss_textRetrieve(
+            dss, pn2.as_ptr(), buf2.as_mut_ptr() as *mut std::os::raw::c_char, 256
+        );
+        assert_eq!(s2, 0, "C should read second Rust-written record");
+        let text2 = std::ffi::CStr::from_ptr(buf2.as_ptr() as *const std::os::raw::c_char)
+            .to_str().unwrap();
+        assert_eq!(text2, "Second record from Rust");
+
+        hec_dss_close(dss);
+    }
+
+    println!("Pure Rust text write -> C library read = SUCCESS");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Create a DSS7 file in pure Rust, then verify the C library can open it,
 /// write to it, and the data can be read back in pure Rust.
 #[test]

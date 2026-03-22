@@ -12,3 +12,4 @@ pub mod bin;
 pub mod record;
 pub mod locking;
 pub mod writer;
+pub mod native;
