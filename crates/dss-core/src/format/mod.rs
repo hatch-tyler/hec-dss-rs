@@ -7,3 +7,6 @@ pub mod hash;
 pub mod keys;
 pub mod header;
 pub mod pathname;
+pub mod io;
+pub mod bin;
+pub mod record;

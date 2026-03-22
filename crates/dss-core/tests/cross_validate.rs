@@ -2,6 +2,9 @@
 
 use dss_core::format::hash;
 use dss_core::format::header::FileHeader;
+use dss_core::format::bin;
+use dss_core::format::record::RecordInfo;
+use dss_core::format::io as dss_io;
 use std::ffi::CString;
 use std::fs::File;
 
@@ -129,6 +132,197 @@ fn test_hash_table_navigation() {
 
     // If bin_address > 0, we found an entry (the hash table slot is not empty)
     assert!(bin_address > 0, "Hash table slot should point to a bin");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Use the bin reader to scan all pathnames in a file created by the C library.
+#[test]
+fn test_catalog_via_bin_scanning() {
+    let path = std::env::temp_dir().join("cross_validate_bins.dss");
+    let path_str = path.to_str().unwrap();
+    let c_path = CString::new(path_str).unwrap();
+
+    let written_paths = [
+        "/BASIN/LOC/FLOW/01JAN2020/1HOUR/OBS/",
+        "/BASIN/LOC/STAGE///COMPUTED/",
+        "/OTHER/SITE/PRECIP/01JAN2020/1DAY/NEXRAD/",
+    ];
+
+    // Create via C library
+    unsafe {
+        use dss_sys::*;
+        let mut dss: *mut dss_file = std::ptr::null_mut();
+        hec_dss_open(c_path.as_ptr(), &mut dss);
+
+        for pn in &written_paths {
+            let c_pn = CString::new(*pn).unwrap();
+            let c_text = CString::new("test data").unwrap();
+            hec_dss_textStore(dss, c_pn.as_ptr(), c_text.as_ptr(), 9);
+        }
+        hec_dss_close(dss);
+    }
+
+    // Read catalog in pure Rust
+    let mut file = File::open(&path).unwrap();
+    let header = FileHeader::read_from(&mut file).unwrap();
+
+    let entries = bin::read_all_bins(
+        &mut file,
+        header.first_bin_address(),
+        header.bin_size(),
+        header.bins_per_block(),
+    ).unwrap();
+
+    println!("Found {} bin entries", entries.len());
+    for entry in &entries {
+        println!("  {} [type={}, status={}]", entry.pathname, entry.data_type, entry.status);
+    }
+
+    // Should find all 3 pathnames
+    let found_paths: Vec<&str> = entries.iter()
+        .filter(|e| e.status == 1) // valid entries only
+        .map(|e| e.pathname.as_str())
+        .collect();
+
+    for expected in &written_paths {
+        assert!(
+            found_paths.iter().any(|p| p.eq_ignore_ascii_case(expected)),
+            "Expected to find {expected} in catalog, got: {found_paths:?}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Find a specific pathname using hash lookup, then read its record info.
+#[test]
+fn test_find_pathname_and_read_info() {
+    let path = std::env::temp_dir().join("cross_validate_find.dss");
+    let path_str = path.to_str().unwrap();
+    let c_path = CString::new(path_str).unwrap();
+    let target = "/FIND/ME/NOTE///HERE/";
+
+    // Create via C
+    unsafe {
+        use dss_sys::*;
+        let mut dss: *mut dss_file = std::ptr::null_mut();
+        hec_dss_open(c_path.as_ptr(), &mut dss);
+        let c_pn = CString::new(target).unwrap();
+        let c_text = CString::new("found you").unwrap();
+        hec_dss_textStore(dss, c_pn.as_ptr(), c_text.as_ptr(), 9);
+        hec_dss_close(dss);
+    }
+
+    // Find in pure Rust
+    let mut file = File::open(&path).unwrap();
+    let header = FileHeader::read_from(&mut file).unwrap();
+
+    let max_hash = header.max_hash();
+    let th = hash::table_hash(target.as_bytes(), max_hash);
+    let ph = hash::pathname_hash(target.as_bytes());
+
+    let entry = bin::find_pathname(
+        &mut file,
+        header.hash_table_start(),
+        th,
+        ph,
+        target,
+        header.bin_size(),
+    ).unwrap();
+
+    assert!(entry.is_some(), "Should find pathname in bins");
+    let entry = entry.unwrap();
+    assert_eq!(entry.pathname_hash, ph);
+    assert!(entry.info_address > 0);
+
+    // Read record info
+    let info = RecordInfo::read_from(&mut file, entry.info_address).unwrap();
+    assert!(info.is_some(), "Should read valid record info");
+    let info = info.unwrap();
+
+    println!("Record info for {target}:");
+    println!("  pathname: {}", info.pathname);
+    println!("  data_type: {}", info.data_type());
+    println!("  version: {}", info.version());
+    println!("  values1 address: {}, count: {}", info.values1_address(), info.values1_number());
+
+    assert_eq!(info.data_type(), 300, "Text record should be type 300");
+    assert!(info.values1_address() > 0 || info.values3_address() > 0,
+            "Should have data stored somewhere");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Read actual text data via pure Rust by following the record info addresses.
+#[test]
+fn test_read_text_data_pure_rust() {
+    let path = std::env::temp_dir().join("cross_validate_text.dss");
+    let path_str = path.to_str().unwrap();
+    let c_path = CString::new(path_str).unwrap();
+    let target = "/TEST/PURE/NOTE///RUST/";
+    let expected_text = "Hello from pure Rust reader!";
+
+    // Create via C
+    unsafe {
+        use dss_sys::*;
+        let mut dss: *mut dss_file = std::ptr::null_mut();
+        hec_dss_open(c_path.as_ptr(), &mut dss);
+        let c_pn = CString::new(target).unwrap();
+        let c_text = CString::new(expected_text).unwrap();
+        hec_dss_textStore(dss, c_pn.as_ptr(), c_text.as_ptr(), expected_text.len() as i32);
+        hec_dss_close(dss);
+    }
+
+    // Read in pure Rust
+    let mut file = File::open(&path).unwrap();
+    let header = FileHeader::read_from(&mut file).unwrap();
+
+    // Find pathname
+    let max_hash = header.max_hash();
+    let th = hash::table_hash(target.as_bytes(), max_hash);
+    let ph = hash::pathname_hash(target.as_bytes());
+
+    let entry = bin::find_pathname(
+        &mut file,
+        header.hash_table_start(),
+        th, ph, target,
+        header.bin_size(),
+    ).unwrap().expect("Should find pathname");
+
+    // Read record info
+    let info = RecordInfo::read_from(&mut file, entry.info_address)
+        .unwrap().expect("Should read info");
+
+    // Text data is stored in values3 for text records
+    let v3_addr = info.values3_address();
+    let v3_num = info.values3_number();
+
+    // Also check values1 (some text records use values1)
+    let v1_addr = info.values1_address();
+    let v1_num = info.values1_number();
+
+    println!("values1: addr={v1_addr}, num={v1_num}");
+    println!("values3: addr={v3_addr}, num={v3_num}");
+
+    // Read whichever data area has the text
+    let data_addr = if v3_num > 0 { v3_addr } else { v1_addr };
+    let data_num = if v3_num > 0 { v3_num } else { v1_num };
+
+    assert!(data_num > 0, "Should have data stored");
+
+    let raw_bytes = RecordInfo::read_data_area(&mut file, data_addr, data_num).unwrap();
+
+    // Text is stored as raw bytes (may be padded)
+    let text = String::from_utf8_lossy(&raw_bytes)
+        .trim_end_matches('\0')
+        .to_string();
+
+    println!("Read text: '{text}'");
+    assert!(
+        text.contains(expected_text),
+        "Expected to find '{expected_text}' in '{text}'"
+    );
 
     let _ = std::fs::remove_file(&path);
 }
