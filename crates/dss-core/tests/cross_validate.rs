@@ -328,6 +328,69 @@ fn test_read_text_data_pure_rust() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Write time series via C, then read via pure Rust NativeDssFile.
+#[test]
+fn test_c_writes_ts_rust_reads() {
+    use dss_core::NativeDssFile;
+
+    let path = std::env::temp_dir().join("cross_validate_ts_read.dss");
+    let _ = std::fs::remove_file(&path);
+    let c_path = CString::new(path.to_str().unwrap()).unwrap();
+
+    // Write TS via C library
+    unsafe {
+        use dss_sys::*;
+        let mut dss: *mut dss_file = std::ptr::null_mut();
+        hec_dss_open(c_path.as_ptr(), &mut dss);
+
+        let pathname = CString::new("/BASIN/LOC/FLOW/01JAN2020/1HOUR/OBS/").unwrap();
+        let start_date = CString::new("01JAN2020").unwrap();
+        let start_time = CString::new("01:00").unwrap();
+        let units = CString::new("CFS").unwrap();
+        let dtype = CString::new("INST-VAL").unwrap();
+        let tz = CString::new("").unwrap();
+        let mut values = [100.0f64, 200.0, 300.0, 400.0, 500.0];
+
+        let status = hec_dss_tsStoreRegular(
+            dss, pathname.as_ptr(),
+            start_date.as_ptr(), start_time.as_ptr(),
+            values.as_mut_ptr(), 5,
+            std::ptr::null_mut(), 0, 0,
+            units.as_ptr(), dtype.as_ptr(), tz.as_ptr(), 0,
+        );
+        assert_eq!(status, 0);
+        hec_dss_close(dss);
+    }
+
+    // Read via pure Rust
+    let mut dss = NativeDssFile::open(path.to_str().unwrap()).unwrap();
+    assert_eq!(dss.record_count(), 1);
+
+    let cat = dss.catalog().unwrap();
+    assert_eq!(cat.len(), 1);
+    println!("Catalog: {:?}", cat[0]);
+
+    let ts = dss.read_ts(&cat[0].pathname).unwrap();
+    assert!(ts.is_some(), "Should read time series record");
+    let ts = ts.unwrap();
+
+    println!("TS record: type={}, values={}, granularity={}",
+        ts.record_type, ts.values.len(), ts.time_granularity);
+    println!("Units: {:?}", ts.units);
+    println!("First 5 values: {:?}", &ts.values[..std::cmp::min(5, ts.values.len())]);
+
+    // Verify the values we wrote
+    assert!(ts.values.len() >= 5, "Should have at least 5 values");
+    assert!((ts.values[0] - 100.0).abs() < 0.001);
+    assert!((ts.values[1] - 200.0).abs() < 0.001);
+    assert!((ts.values[2] - 300.0).abs() < 0.001);
+    assert!((ts.values[3] - 400.0).abs() < 0.001);
+    assert!((ts.values[4] - 500.0).abs() < 0.001);
+
+    println!("C writes TS -> pure Rust reads = SUCCESS");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Write text records in pure Rust, then verify the C library can read them.
 #[test]
 fn test_rust_writes_text_c_reads() {

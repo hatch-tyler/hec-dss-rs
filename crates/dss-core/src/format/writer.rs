@@ -65,15 +65,18 @@ pub fn create_dss_file(path: &Path) -> io::Result<File> {
     header[fh::BINS_OVERFLOW] = 0;
     header[fh::FILE_PASSWORD] = 0;
 
-    // Reclaim settings
-    header[39] = 100;   // kreclaimMin
-    header[40] = 0;     // kreclaimMaxAvailable
-    header[41] = 0;     // kreclaimTotal
-    header[47] = DEFAULT_RECLAIM_SIZE; // kreclaimNumber = (size-2)/2
-    header[48] = DEFAULT_RECLAIM_SIZE; // kreclaimSize
-    header[44] = 0;     // kreclaimSegNumber
-    header[45] = 20;    // kreclaimMaxSegment
-    header[46] = 0;     // kreclaimSegmentsUsed
+    // Reclaim settings (offsets from zdssFileKeys in zinit.c)
+    header[fh::RECLAIM_MIN] = 100;
+    header[fh::RECLAIM_MAX_AVAILABLE] = 0;
+    header[fh::RECLAIM_TOTAL] = 0;
+    header[fh::RECLAIM_TABLE_ADDRESS] = 0; // set later when allocated
+    // kreclaimSegNumber=44, kreclaimMaxSegment=45, kreclaimSegmentsUsed=46
+    header[44] = 0;     // reclaimSegNumber
+    header[45] = 20;    // reclaimMaxSegment
+    header[46] = 0;     // reclaimSegmentsUsed
+    // kreclaimNumber=47, kreclaimSize=48
+    header[47] = (DEFAULT_RECLAIM_SIZE - 2) / 2; // reclaimNumber
+    header[48] = DEFAULT_RECLAIM_SIZE;            // reclaimSize
 
     // End-of-header flag
     header[fh::END_FILE_HEADER] = super::keys::DSS_END_HEADER_FLAG;

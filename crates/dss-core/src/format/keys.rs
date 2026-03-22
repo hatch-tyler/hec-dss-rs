@@ -140,3 +140,42 @@ pub const DEFAULT_BIN_SIZE: i32 = 60;
 
 /// Default bins per block.
 pub const DEFAULT_BINS_PER_BLOCK: i32 = 100;
+
+/// Internal header offsets for time series records (i32 positions).
+pub mod ts_internal_header {
+    pub const TIME_GRANULARITY: usize = 0;
+    pub const PRECISION: usize = 1;
+    pub const TIME_OFFSET: usize = 2;
+    pub const PROFILE_DEPTHS_NUMBER: usize = 3;
+    pub const BLOCK_START_POSITION: usize = 4;
+    pub const BLOCK_END_POSITION: usize = 5;
+    pub const VALUES_NUMBER: usize = 6;
+    pub const VALUE_SIZE: usize = 7;
+    pub const VALUE_ELEMENT_SIZE: usize = 8;
+    pub const VALUES_COMPRESSION_FLAG: usize = 9;
+    pub const QUALITY_NUMBER: usize = 10;
+    pub const QUALITY_ELEMENT_SIZE: usize = 11;
+    pub const QUALITY_COMPRESSION_FLAG: usize = 12;
+    pub const INOTES_NUMBER: usize = 13;
+    pub const INOTES_ELEMENT_SIZE: usize = 14;
+    pub const INOTES_COMPRESSION_FLAG: usize = 15;
+    pub const CNOTES_LENGTH: usize = 16;
+    pub const UNITS: usize = 17;
+}
+
+/// Data type codes.
+pub mod data_type {
+    pub const RTS: i32 = 100;       // Regular time series (floats)
+    pub const RTD: i32 = 105;       // Regular time series (doubles)
+    pub const ITS: i32 = 110;       // Irregular time series (floats)
+    pub const ITD: i32 = 115;       // Irregular time series (doubles)
+    pub const PD: i32 = 200;        // Paired data (floats)
+    pub const PDD: i32 = 205;       // Paired data (doubles)
+    pub const TEXT: i32 = 300;       // Text
+    pub const TEXT_TABLE: i32 = 310; // Text table
+
+    pub fn is_time_series(dt: i32) -> bool { (100..120).contains(&dt) }
+    pub fn is_regular_ts(dt: i32) -> bool { (100..110).contains(&dt) }
+    pub fn is_irregular_ts(dt: i32) -> bool { (110..120).contains(&dt) }
+    pub fn is_double_ts(dt: i32) -> bool { dt == RTD || dt == ITD }
+}

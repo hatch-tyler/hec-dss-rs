@@ -13,10 +13,22 @@ pub enum DssError {
     #[error("DSS file is not open")]
     NotOpen,
 
+    #[error("Not a valid DSS7 file: {0}")]
+    InvalidFile(String),
+
+    #[error("Record not found: {0}")]
+    RecordNotFound(String),
+
+    #[error("Corrupt file structure: {0}")]
+    CorruptFile(String),
+
     #[error("Invalid pathname: {0}")]
     InvalidPathname(String),
 
-    #[error("Null pointer in C string conversion")]
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Null byte in string")]
     NulError(#[from] std::ffi::NulError),
 }
 

@@ -106,7 +106,10 @@ impl DssFile {
         let mut path_buf: Vec<u8> = vec![0u8; n * item_size];
         let mut record_types: Vec<c_int> = vec![0; n];
 
-        let c_filter = filter.map(|f| CString::new(f).unwrap());
+        let c_filter = match filter {
+            Some(f) => Some(CString::new(f)?),
+            None => None,
+        };
         let filter_ptr = c_filter
             .as_ref()
             .map(|f| f.as_ptr())
