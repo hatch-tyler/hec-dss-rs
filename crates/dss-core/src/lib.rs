@@ -18,6 +18,11 @@
 
 mod error;
 mod file;
+pub mod format;
 
 pub use error::DssError;
 pub use file::{CatalogEntry, DssFile, TimeSeriesData};
+pub use format::hash;
+pub use format::keys;
+pub use format::pathname::Pathname;
+pub use format::header::FileHeader;
