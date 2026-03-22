@@ -1,0 +1,10 @@
+[package]
+name = "dss-core"
+description = "Safe Rust interface for HEC-DSS version 7 files"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+dss-sys = { path = "../dss-sys" }
+thiserror = "2"
