@@ -180,6 +180,30 @@ pub struct PairedDataRecord {
     pub record_type: i32,
 }
 
+/// Array data read from a DSS7 file.
+#[derive(Debug, Clone, Default)]
+pub struct ArrayRecord {
+    pub int_values: Vec<i32>,
+    pub float_values: Vec<f32>,
+    pub double_values: Vec<f64>,
+}
+
+/// Location data read from a DSS7 file.
+#[derive(Debug, Clone, Default)]
+pub struct LocationRecord {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub coordinate_system: i32,
+    pub coordinate_id: i32,
+    pub horizontal_units: i32,
+    pub horizontal_datum: i32,
+    pub vertical_units: i32,
+    pub vertical_datum: i32,
+    pub timezone: String,
+    pub supplemental: String,
+}
+
 // ---------------------------------------------------------------------------
 // NativeDssFile
 // ---------------------------------------------------------------------------
@@ -966,6 +990,199 @@ impl NativeDssFile {
     }
 
     // -----------------------------------------------------------------------
+    // Array records
+    // -----------------------------------------------------------------------
+
+    /// Read an array record.
+    pub fn read_array(&mut self, pathname: &str) -> io::Result<Option<ArrayRecord>> {
+        let info = match self.read_record_info(pathname)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        // values1 = ints, values2 = floats, values3 = doubles
+        let ints = if info.values1_number() > 0 {
+            let raw = RecordInfo::read_data_area(&mut self.file, info.values1_address(), info.values1_number())?;
+            decode_i32s(&raw)
+        } else { Vec::new() };
+
+        let floats = if info.values2_number() > 0 {
+            let raw = RecordInfo::read_data_area(&mut self.file, info.values2_address(), info.values2_number())?;
+            raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+        } else { Vec::new() };
+
+        let doubles = if info.values3_number() > 0 {
+            let raw = RecordInfo::read_data_area(&mut self.file, info.values3_address(), info.values3_number())?;
+            decode_f64s(&raw)
+        } else { Vec::new() };
+
+        Ok(Some(ArrayRecord { int_values: ints, float_values: floats, double_values: doubles }))
+    }
+
+    /// Write an array record. At least one of ints, floats, or doubles must be non-empty.
+    pub fn write_array(
+        &mut self,
+        pathname: &str,
+        ints: &[i32],
+        floats: &[f32],
+        doubles: &[f64],
+    ) -> io::Result<()> {
+        validate_pathname(pathname)?;
+        if ints.is_empty() && floats.is_empty() && doubles.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "All arrays are empty"));
+        }
+        let path_bytes = pathname.as_bytes();
+
+        let v1_ints = ints.len();
+        let v1_longs = num_longs_in_ints(v1_ints);
+        let v2_ints = floats.len();
+        let v2_longs = num_longs_in_ints(v2_ints);
+        let v3_ints = doubles.len() * 2; // doubles = 2 i32 words each
+        let v3_longs = doubles.len();
+        let ih_ints = 1usize;
+        let ih_longs = 1usize;
+        let path_longs = num_longs_in_bytes(path_bytes.len());
+        let info_size = ri::PATHNAME + path_longs;
+        let total = info_size + ih_longs + v1_longs + v2_longs + v3_longs;
+
+        let base = self.file_size();
+        let info_addr = base;
+        let ih_addr = base + info_size as i64;
+        let v1_addr = ih_addr + ih_longs as i64;
+        let v2_addr = v1_addr + v1_longs as i64;
+        let v3_addr = v2_addr + v2_longs as i64;
+        let new_eof = base + total as i64;
+
+        let ph = hash::pathname_hash(path_bytes);
+        let th = hash::table_hash(path_bytes, self.max_hash());
+        let now = current_time_millis();
+
+        // Determine sub-type
+        let sub_type: i32 = if !doubles.is_empty() { 93 }
+            else if !floats.is_empty() { 92 }
+            else { 91 };
+
+        // Info block
+        let mut info = vec![0i64; info_size];
+        info[ri::FLAG] = keys::DSS_INFO_FLAG;
+        info[ri::STATUS] = keys::record_status::PRIMARY;
+        info[ri::PATHNAME_LENGTH] = path_bytes.len() as i64;
+        info[ri::HASH] = ph;
+        info[ri::TYPE_VERSION] = dss_io::pack_i4(90, 1); // DATA_TYPE_ARRAY
+        info[ri::LAST_WRITE_TIME] = now;
+        info[ri::CREATION_TIME] = now;
+        info[ri::INTERNAL_HEAD_ADDRESS] = ih_addr;
+        info[ri::INTERNAL_HEAD_NUMBER] = ih_ints as i64;
+        if v1_ints > 0 { info[ri::VALUES1_ADDRESS] = v1_addr; info[ri::VALUES1_NUMBER] = v1_ints as i64; }
+        if v2_ints > 0 { info[ri::VALUES2_ADDRESS] = v2_addr; info[ri::VALUES2_NUMBER] = v2_ints as i64; }
+        if v3_ints > 0 { info[ri::VALUES3_ADDRESS] = v3_addr; info[ri::VALUES3_NUMBER] = v3_ints as i64; }
+        info[ri::ALLOCATED_SIZE] = (total * 2) as i64;
+        let n_data = ints.len() + floats.len() + doubles.len();
+        info[ri::NUMBER_DATA] = n_data as i64;
+        info[ri::LOGICAL_NUMBER] = n_data as i64;
+        let pw = bytes_to_words(path_bytes);
+        info[ri::PATHNAME..ri::PATHNAME + pw.len()].copy_from_slice(&pw);
+        write_words(&mut self.file, info_addr, &info)?;
+
+        // Internal header (1 i32 = sub-type)
+        write_words(&mut self.file, ih_addr, &[sub_type as i64])?;
+
+        // Values1 (ints)
+        if !ints.is_empty() {
+            let words: Vec<i64> = ints.chunks(2).map(|c| {
+                let low = c[0];
+                let high = if c.len() > 1 { c[1] } else { 0 };
+                dss_io::pack_i4(low, high)
+            }).collect();
+            let mut padded = words;
+            padded.resize(v1_longs, 0);
+            write_words(&mut self.file, v1_addr, &padded)?;
+        }
+
+        // Values2 (floats)
+        if !floats.is_empty() {
+            let words: Vec<i64> = floats.chunks(2).map(|c| {
+                let mut bytes = [0u8; 8];
+                bytes[0..4].copy_from_slice(&c[0].to_le_bytes());
+                if c.len() > 1 { bytes[4..8].copy_from_slice(&c[1].to_le_bytes()); }
+                i64::from_le_bytes(bytes)
+            }).collect();
+            let mut padded = words;
+            padded.resize(v2_longs, 0);
+            write_words(&mut self.file, v2_addr, &padded)?;
+        }
+
+        // Values3 (doubles)
+        if !doubles.is_empty() {
+            let words: Vec<i64> = doubles.iter().map(|&v| i64::from_le_bytes(v.to_le_bytes())).collect();
+            write_words(&mut self.file, v3_addr, &words)?;
+        }
+
+        // EOF
+        write_words(&mut self.file, new_eof, &[keys::DSS_END_FILE_FLAG])?;
+
+        self.write_bin_entry(pathname, ph, th, info_addr, 90, now)?;
+        self.header[fh::NUMBER_RECORDS] += 1;
+        self.header[fh::FILE_SIZE] = new_eof;
+        self.header[fh::LAST_WRITE_TIME] = now;
+        write_words(&mut self.file, 0, &self.header)?;
+        self.file.flush()
+    }
+
+    // -----------------------------------------------------------------------
+    // Location records
+    // -----------------------------------------------------------------------
+
+    /// Read location data. Returns coordinates, datum info, timezone, supplemental.
+    pub fn read_location(&mut self, pathname: &str) -> io::Result<Option<LocationRecord>> {
+        let info = match self.read_record_info(pathname)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        // Location data is in values1: 6 ints for coordinates (3 doubles packed as 6 floats),
+        // then int fields, then timezone string, then supplemental in user header
+        let v1_num = info.values1_number();
+        if v1_num <= 0 {
+            return Ok(Some(LocationRecord::default()));
+        }
+
+        let raw = RecordInfo::read_data_area(&mut self.file, info.values1_address(), v1_num)?;
+        let i32s = decode_i32s(&raw);
+
+        // First 6 i32s are 3 doubles packed as float pairs
+        let x = if i32s.len() >= 2 { f64::from(f32::from_le_bytes(i32s[0].to_le_bytes())) } else { 0.0 };
+        let y = if i32s.len() >= 4 { f64::from(f32::from_le_bytes(i32s[2].to_le_bytes())) } else { 0.0 };
+        let z = if i32s.len() >= 6 { f64::from(f32::from_le_bytes(i32s[4].to_le_bytes())) } else { 0.0 };
+
+        let coord_sys = i32s.get(6).copied().unwrap_or(0);
+        let coord_id = i32s.get(7).copied().unwrap_or(0);
+        let h_units = i32s.get(8).copied().unwrap_or(0);
+        let h_datum = i32s.get(9).copied().unwrap_or(0);
+        let v_units = i32s.get(10).copied().unwrap_or(0);
+        let v_datum = i32s.get(11).copied().unwrap_or(0);
+
+        // Timezone and supplemental may be in the remaining values1 or user header
+        let tz = if i32s.len() > 12 {
+            extract_string_from_i32s(&i32s[12..])
+        } else { String::new() };
+
+        let supplemental = self.read_string_area(info.user_header_address(), info.user_header_number())?;
+
+        Ok(Some(LocationRecord {
+            x, y, z,
+            coordinate_system: coord_sys,
+            coordinate_id: coord_id,
+            horizontal_units: h_units,
+            horizontal_datum: h_datum,
+            vertical_units: v_units,
+            vertical_datum: v_datum,
+            timezone: tz,
+            supplemental,
+        }))
+    }
+
+    // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
@@ -1335,6 +1552,39 @@ mod tests {
             assert_eq!(d.read_text("/A/B/NOTE///THREE/").unwrap(), Some("Third".into()));
             assert_eq!(d.read_text("/A/B/NOTE///TWO/").unwrap(), None);
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_array_roundtrip() {
+        let p = temp_path("array_rt");
+        let _ = std::fs::remove_file(&p);
+        {
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            d.write_array("/A/B/DATA///ARR/", &[1, 2, 3], &[], &[10.0, 20.0]).unwrap();
+        }
+        {
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            let arr = d.read_array("/A/B/DATA///ARR/").unwrap().unwrap();
+            assert_eq!(arr.int_values, vec![1, 2, 3]);
+            assert!(arr.float_values.is_empty());
+            assert_eq!(arr.double_values.len(), 2);
+            assert!((arr.double_values[0] - 10.0).abs() < 0.001);
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_array_doubles_only() {
+        let p = temp_path("array_dbl");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        d.write_array("/A/B/DATA///DBL/", &[], &[], &[1.1, 2.2, 3.3]).unwrap();
+        let arr = d.read_array("/A/B/DATA///DBL/").unwrap().unwrap();
+        assert!(arr.int_values.is_empty());
+        assert!(arr.float_values.is_empty());
+        assert_eq!(arr.double_values.len(), 3);
+        assert!((arr.double_values[2] - 3.3).abs() < 0.001);
         let _ = std::fs::remove_file(&p);
     }
 
