@@ -4,9 +4,13 @@
 //! producing files that are fully compatible with the C library.
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read as _, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use flate2::read::ZlibDecoder;
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
 
 use super::bin::{self, BinEntry};
 use super::hash;
@@ -2017,6 +2021,16 @@ impl NativeDssFile {
             }
         }
 
+        // Compress data with zlib
+        let raw_bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(&raw_bytes)?;
+        let compressed = encoder.finish()?;
+
+        // Store compressed size in internal header
+        ih_i32[7] = compressed.len() as i32;
+
+        // Now pack internal header into i64 words (after setting compressed size)
         let ih_ints = ih_i32.len();
         let ih_longs = num_longs_in_ints(ih_ints);
         let mut ih_words = vec![0i64; ih_longs];
@@ -2024,15 +2038,10 @@ impl NativeDssFile {
             ih_words[i] = dss_io::pack_i4(chunk[0], if chunk.len() > 1 { chunk[1] } else { 0 });
         }
 
-        // Data as values1 (floats packed into i32 words)
-        let v1_ints = data.len();
+        // Pack compressed bytes into i64 words
+        let v1_ints = num_ints_in_bytes(compressed.len());
         let v1_longs = num_longs_in_ints(v1_ints);
-        let v1_words: Vec<i64> = data.chunks(2).map(|c| {
-            let mut bytes = [0u8; 8];
-            bytes[0..4].copy_from_slice(&c[0].to_le_bytes());
-            if c.len() > 1 { bytes[4..8].copy_from_slice(&c[1].to_le_bytes()); }
-            i64::from_le_bytes(bytes)
-        }).collect();
+        let v1_words = bytes_to_words(&compressed);
 
         let path_longs = num_longs_in_bytes(path_bytes.len());
         let info_size = ri::PATHNAME + path_longs;
@@ -2099,10 +2108,23 @@ impl NativeDssFile {
             extract_string_from_i32s(&ih[10..])
         } else { String::new() };
 
-        // Data from values1
+        // Compressed size from internal header position 7
+        let compressed_size = ih.get(7).copied().unwrap_or(0);
+
+        // Data from values1 (may be compressed)
         let data = if info.values1_number() > 0 {
             let raw = RecordInfo::read_data_area(&mut self.file, info.values1_address(), info.values1_number())?;
-            raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+            if compressed_size > 0 {
+                // Decompress with zlib
+                let compressed = &raw[..compressed_size as usize];
+                let mut decoder = ZlibDecoder::new(compressed);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed)?;
+                decompressed.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+            } else {
+                // Uncompressed (legacy or small grids)
+                raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+            }
         } else { Vec::new() };
 
         Ok(Some(GridRecord {
