@@ -4,6 +4,7 @@ members = [
     "crates/dss-sys",
     "crates/dss-core",
     "crates/dss-ffi",
+    "crates/dss-python",
 ]
 
 [workspace.package]

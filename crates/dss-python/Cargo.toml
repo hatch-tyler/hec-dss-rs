@@ -1,0 +1,15 @@
+[package]
+name = "dss-python"
+description = "Python bindings for HEC-DSS via PyO3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "hecdss_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+pyo3 = { version = "0.23", features = ["extension-module"] }
+numpy = "0.23"

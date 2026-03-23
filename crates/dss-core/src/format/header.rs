@@ -14,21 +14,27 @@ pub struct FileHeader {
 
 impl FileHeader {
     /// Read the file header from a DSS7 file.
+    ///
+    /// Detects endianness by checking the DSS identifier. If the file was
+    /// written on a big-endian system, all i64 words are byte-swapped.
     pub fn read_from(file: &mut File) -> io::Result<Self> {
-        // Seek to beginning
         file.seek(SeekFrom::Start(0))?;
 
-        // Read the header as i64 words
-        let mut raw = vec![0i64; fh::HEADER_SIZE];
         let mut buf = vec![0u8; fh::HEADER_SIZE * 8];
         file.read_exact(&mut buf)?;
 
-        // Convert bytes to i64 (little-endian on x86)
+        // Check endianness: first 4 bytes should be "ZDSS" in LE
+        let needs_swap = &buf[0..4] != keys::DSS_IDENTIFIER;
+
+        let mut raw = vec![0i64; fh::HEADER_SIZE];
         for i in 0..fh::HEADER_SIZE {
-            raw[i] = i64::from_le_bytes([
-                buf[i * 8],     buf[i * 8 + 1], buf[i * 8 + 2], buf[i * 8 + 3],
-                buf[i * 8 + 4], buf[i * 8 + 5], buf[i * 8 + 6], buf[i * 8 + 7],
-            ]);
+            let b = &buf[i * 8..(i + 1) * 8];
+            raw[i] = if needs_swap {
+                // Big-endian file: swap bytes
+                i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+            } else {
+                i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+            };
         }
 
         Ok(FileHeader { raw })
@@ -38,6 +44,12 @@ impl FileHeader {
     pub fn is_valid_dss(&self) -> bool {
         let id_bytes = self.raw[fh::DSS_IDENTIFIER].to_le_bytes();
         &id_bytes[0..4] == keys::DSS_IDENTIFIER
+    }
+
+    /// Check if this file was originally written on a big-endian system.
+    pub fn is_big_endian(&self) -> bool {
+        // If endian field is set, use it. Otherwise infer from context.
+        self.raw[fh::ENDIAN] == 0 || self.raw[fh::ENDIAN] == -1
     }
 
     /// Check if the end-of-header flag is present.
