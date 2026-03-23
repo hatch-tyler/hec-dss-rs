@@ -14,3 +14,4 @@ pub mod locking;
 pub mod writer;
 pub mod native;
 pub mod datetime;
+pub mod v6;
