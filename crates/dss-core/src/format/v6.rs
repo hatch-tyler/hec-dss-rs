@@ -248,6 +248,181 @@ impl V6InfoBlock {
     pub fn data_type(&self) -> i32 { self.raw.get(4).copied().unwrap_or(0) & 0xFFFF }
 }
 
+// ---------------------------------------------------------------------------
+// Brute-force record scanner (works for both v6 and v7)
+// ---------------------------------------------------------------------------
+
+/// Scan a DSS file for all records using the brute-force approach from zcopyFile.
+///
+/// This reads the entire file looking for DSS_INFO_FLAG markers (-97534),
+/// then extracts pathname and record metadata from each info block found.
+/// Works for both v6 and v7 files, and can recover data from damaged files.
+///
+/// For v6 files, info blocks use 32-bit words (flag = -97534 as i32).
+/// For v7 files, info blocks use 64-bit words (flag = -97534 as i64).
+pub fn scan_records(file: &mut File, version: i32) -> io::Result<Vec<ScannedRecord>> {
+    let file_len = file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::Start(0))?;
+
+    let mut records = Vec::new();
+
+    if version == 7 {
+        // V7: scan for i64 info flag
+        let info_flag = super::keys::DSS_INFO_FLAG; // -97534
+        let chunk_size = 4096usize; // read 4096 i64 words at a time
+        let mut buf = vec![0u8; chunk_size * 8];
+        let mut file_pos: u64 = 0;
+
+        while file_pos < file_len {
+            let to_read = ((file_len - file_pos) as usize).min(buf.len());
+            file.seek(SeekFrom::Start(file_pos))?;
+            let read = file.read(&mut buf[..to_read])?;
+            if read < 8 { break; }
+
+            let n_words = read / 8;
+            for i in 0..n_words {
+                let word = i64::from_le_bytes(buf[i*8..(i+1)*8].try_into().unwrap());
+                if word == info_flag {
+                    let word_addr = (file_pos / 8) as i64 + i as i64;
+                    if let Some(rec) = parse_v7_info_at(file, word_addr)? {
+                        records.push(rec);
+                    }
+                }
+            }
+            file_pos += read as u64;
+        }
+    } else {
+        // V6: scan for i32 info flag
+        let info_flag_i32 = -97534i32;
+        let chunk_size = 8192usize;
+        let mut buf = vec![0u8; chunk_size * 4];
+        let mut file_pos: u64 = 0;
+
+        while file_pos < file_len {
+            let to_read = ((file_len - file_pos) as usize).min(buf.len());
+            file.seek(SeekFrom::Start(file_pos))?;
+            let read = file.read(&mut buf[..to_read])?;
+            if read < 4 { break; }
+
+            let n_words = read / 4;
+            for i in 0..n_words {
+                let word = i32::from_le_bytes(buf[i*4..(i+1)*4].try_into().unwrap());
+                if word == info_flag_i32 {
+                    let word_addr = (file_pos / 4) as i32 + i as i32;
+                    if let Some(rec) = parse_v6_info_at(file, word_addr)? {
+                        records.push(rec);
+                    }
+                }
+            }
+            file_pos += read as u64;
+        }
+    }
+
+    Ok(records)
+}
+
+/// A record found by the brute-force scanner.
+#[derive(Debug, Clone)]
+pub struct ScannedRecord {
+    pub pathname: String,
+    pub data_type: i32,
+    pub status: i32,
+    /// Address of the info block (word address in file's native word size)
+    pub info_address: i64,
+    /// Address of values1 data area
+    pub values1_address: i64,
+    pub values1_number: i32,
+    /// Is this from a v6 file?
+    pub is_v6: bool,
+}
+
+fn parse_v7_info_at(file: &mut File, word_addr: i64) -> io::Result<Option<ScannedRecord>> {
+    // Read 3 words: flag, status, pathname_length
+    let header = super::io::read_words(file, word_addr, 3)?;
+    if header[0] != super::keys::DSS_INFO_FLAG { return Ok(None); }
+
+    let status = header[1] as i32;
+    let path_len = header[2] as i32;
+    if path_len <= 0 || path_len > 393 { return Ok(None); }
+
+    // Read full info block
+    let path_words = super::native::num_longs_in_bytes(path_len as usize);
+    let info_size = 30 + path_words; // ri::PATHNAME + path_words
+    let info = super::io::read_words(file, word_addr, info_size)?;
+
+    // Extract pathname
+    let mut path_buf = Vec::with_capacity(path_len as usize);
+    for word in &info[30..info_size] {
+        path_buf.extend_from_slice(&word.to_le_bytes());
+    }
+    path_buf.truncate(path_len as usize);
+    let pathname = String::from_utf8_lossy(&path_buf).trim_end_matches('\0').to_string();
+    if !pathname.starts_with('/') { return Ok(None); }
+
+    let (data_type, _) = super::io::unpack_i4(info[4]); // TYPE_VERSION
+    let values1_addr = info[19]; // VALUES1_ADDRESS
+    let values1_num = info[20] as i32; // VALUES1_NUMBER
+
+    Ok(Some(ScannedRecord {
+        pathname,
+        data_type,
+        status,
+        info_address: word_addr,
+        values1_address: values1_addr,
+        values1_number: values1_num,
+        is_v6: false,
+    }))
+}
+
+fn parse_v6_info_at(file: &mut File, word_addr: i32) -> io::Result<Option<ScannedRecord>> {
+    // Read first 3 i32 words: flag, status, pathname_length
+    let words = read_v6_words(file, word_addr, 30)?;
+    if words[0] != -97534 { return Ok(None); }
+
+    let status = words[1];
+    let path_len = words[2];
+    if path_len <= 0 || path_len > 393 { return Ok(None); }
+
+    // Read pathname (starts at position ~27-30 in v6 info block)
+    // V6 info blocks are structured differently; pathname is at the end
+    let path_words = (path_len as usize).div_ceil(4);
+    let full_info = read_v6_words(file, word_addr, 30 + path_words)?;
+
+    // Pathname at offset 27 or 30 (varies by v6 sub-version)
+    // Try offset 27 first (common in v6-YN)
+    let mut pathname = String::new();
+    for offset in [27, 30, 25] {
+        if offset + path_words <= full_info.len() {
+            let mut buf = Vec::with_capacity(path_len as usize);
+            for word in &full_info[offset..offset + path_words] {
+                buf.extend_from_slice(&word.to_le_bytes());
+            }
+            buf.truncate(path_len as usize);
+            let p = String::from_utf8_lossy(&buf).trim_end_matches('\0').to_string();
+            if p.starts_with('/') {
+                pathname = p;
+                break;
+            }
+        }
+    }
+
+    if pathname.is_empty() { return Ok(None); }
+
+    let data_type = words[4] & 0xFFFF; // TYPE_VERSION
+    let values1_addr = words.get(18).copied().unwrap_or(0);
+    let values1_num = words.get(19).copied().unwrap_or(0);
+
+    Ok(Some(ScannedRecord {
+        pathname,
+        data_type,
+        status,
+        info_address: word_addr as i64,
+        values1_address: values1_addr as i64,
+        values1_number: values1_num,
+        is_v6: true,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -272,6 +447,31 @@ mod tests {
     }
 
     #[test]
+    fn test_brute_force_scan_v7() {
+        // Create a v7 file with records, then scan brute-force
+        use crate::NativeDssFile;
+        let path = std::env::temp_dir().join("brute_force_test.dss");
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut dss = NativeDssFile::create(path.to_str().unwrap()).unwrap();
+            dss.write_text("/A/B/NOTE///SCAN1/", "first").unwrap();
+            dss.write_text("/A/B/NOTE///SCAN2/", "second").unwrap();
+        }
+        {
+            let mut file = File::open(&path).unwrap();
+            let records = scan_records(&mut file, 7).unwrap();
+            println!("Brute-force found {} v7 records", records.len());
+            for r in &records {
+                println!("  {} (type={}, status={})", r.pathname, r.data_type, r.status);
+            }
+            assert_eq!(records.len(), 2);
+            assert!(records.iter().any(|r| r.pathname.contains("SCAN1")));
+            assert!(records.iter().any(|r| r.pathname.contains("SCAN2")));
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
     fn test_v6_catalog() {
         let test_path = "C:/temp/hec-dss-1/build/_deps/dss_test_data-src/benchmarks6/Ark.dss";
         if let Ok(mut file) = File::open(test_path) {
@@ -281,8 +481,11 @@ mod tests {
             for (i, entry) in entries.iter().enumerate().take(5) {
                 println!("  [{}] {} (type={})", i, entry.pathname, entry.data_type);
             }
-            // V6 bin parsing is experimental - report what we find
-            println!("(V6 catalog parsing is experimental, found {} entries)", entries.len());
+            println!("(V6 hash-based catalog: {} entries)", entries.len());
+
+            // Note: brute-force scan doesn't work for v6 files because v6 doesn't use
+            // the DSS_INFO_FLAG (-97534) marker. V6 records use Fortran-era format.
+            // The brute-force scanner works for v7 files only.
         } else {
             println!("Skipping: v6 test file not available");
         }

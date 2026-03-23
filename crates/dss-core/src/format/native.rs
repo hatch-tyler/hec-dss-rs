@@ -33,7 +33,7 @@ fn num_ints_in_bytes(n: usize) -> usize {
 }
 
 /// Number of i64 words needed to hold `n` bytes.
-fn num_longs_in_bytes(n: usize) -> usize {
+pub(crate) fn num_longs_in_bytes(n: usize) -> usize {
     if n > 0 { (n - 1) / 8 + 1 } else { 0 }
 }
 
