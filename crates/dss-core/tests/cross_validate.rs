@@ -489,6 +489,92 @@ fn test_rust_writes_ts_c_reads() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Write paired data in pure Rust, then verify C library can read it.
+#[test]
+fn test_rust_writes_pd_c_reads() {
+    use dss_core::NativeDssFile;
+
+    let path = std::env::temp_dir().join("cross_validate_pd_write.dss");
+    let _ = std::fs::remove_file(&path);
+
+    {
+        let mut dss = NativeDssFile::create(path.to_str().unwrap()).unwrap();
+        dss.write_pd(
+            "/RUST/WROTE/FREQ-FLOW///PD/",
+            &[1.0, 10.0, 100.0],
+            &[500.0, 5000.0, 50000.0],
+            1,
+            "PERCENT", "CFS",
+            None,
+        ).unwrap();
+    }
+
+    let c_path = CString::new(path.to_str().unwrap()).unwrap();
+    unsafe {
+        use dss_sys::*;
+        let mut dss: *mut dss_file = std::ptr::null_mut();
+        let status = hec_dss_open(c_path.as_ptr(), &mut dss);
+        assert_eq!(status, 0, "C should open Rust PD file");
+
+        let pn = CString::new("/RUST/WROTE/FREQ-FLOW///PD/").unwrap();
+        let mut n_ord: i32 = 0;
+        let mut n_curves: i32 = 0;
+        let mut lab_len: i32 = 0;
+        let mut ui = [0i8; 64];
+        let mut ud = [0i8; 64];
+        let mut ti = [0i8; 64];
+        let mut td = [0i8; 64];
+
+        let status = hec_dss_pdRetrieveInfo(
+            dss, pn.as_ptr(), &mut n_ord, &mut n_curves,
+            ui.as_mut_ptr() as *mut _, 64,
+            ud.as_mut_ptr() as *mut _, 64,
+            ti.as_mut_ptr() as *mut _, 64,
+            td.as_mut_ptr() as *mut _, 64,
+            &mut lab_len,
+        );
+        assert_eq!(status, 0, "C pdRetrieveInfo failed");
+        assert_eq!(n_ord, 3);
+        assert_eq!(n_curves, 1);
+
+        let mut ords = vec![0.0f64; n_ord as usize];
+        let mut vals = vec![0.0f64; (n_ord * n_curves) as usize];
+        let mut no2: i32 = 0;
+        let mut nc2: i32 = 0;
+        let mut ui2 = [0i8; 64];
+        let mut ud2 = [0i8; 64];
+        let mut ti2 = [0i8; 64];
+        let mut td2 = [0i8; 64];
+        let mut tz = [0i8; 64];
+        let mut labs = [0i8; 256];
+
+        let status = hec_dss_pdRetrieve(
+            dss, pn.as_ptr(),
+            ords.as_mut_ptr(), n_ord,
+            vals.as_mut_ptr(), n_ord * n_curves,
+            &mut no2, &mut nc2,
+            ui2.as_mut_ptr() as *mut _, 64,
+            ti2.as_mut_ptr() as *mut _, 64,
+            ud2.as_mut_ptr() as *mut _, 64,
+            td2.as_mut_ptr() as *mut _, 64,
+            labs.as_mut_ptr() as *mut _, 256,
+            tz.as_mut_ptr() as *mut _, 64,
+        );
+        assert_eq!(status, 0, "C pdRetrieve failed");
+
+        println!("C reads PD from Rust: ords={ords:?}, vals={vals:?}");
+        assert!((ords[0] - 1.0).abs() < 0.001);
+        assert!((ords[2] - 100.0).abs() < 0.001);
+        assert!((vals[0] - 500.0).abs() < 0.001);
+        assert!((vals[2] - 50000.0).abs() < 0.001);
+
+        hec_dss_close(dss);
+    }
+
+    println!("Pure Rust PD write -> C read = SUCCESS");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Write paired data via C, then read via pure Rust NativeDssFile.
 #[test]
 fn test_c_writes_pd_rust_reads() {

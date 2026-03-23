@@ -620,6 +620,166 @@ impl NativeDssFile {
     }
 
     // -----------------------------------------------------------------------
+    // Paired data write
+    // -----------------------------------------------------------------------
+
+    /// Write a paired data record (double precision).
+    ///
+    /// # Arguments
+    /// * `pathname` - DSS pathname
+    /// * `ordinates` - Independent variable values
+    /// * `values` - Dependent variable values (n_ordinates * n_curves, row-major)
+    /// * `n_curves` - Number of curves
+    /// * `units_independent` - Units for ordinates
+    /// * `units_dependent` - Units for values
+    /// * `labels` - Optional curve labels (null-separated)
+    pub fn write_pd(
+        &mut self,
+        pathname: &str,
+        ordinates: &[f64],
+        values: &[f64],
+        n_curves: usize,
+        units_independent: &str,
+        units_dependent: &str,
+        labels: Option<&[&str]>,
+    ) -> io::Result<()> {
+        let path_bytes = pathname.as_bytes();
+        let n_ord = ordinates.len();
+
+        // Internal header: [n_ordinates, n_curves, bool_x_axis, labels_len, precision, units...]
+        let mut char_data = Vec::new();
+        char_data.extend_from_slice(units_independent.as_bytes());
+        char_data.push(0);
+        char_data.extend_from_slice(units_dependent.as_bytes());
+        char_data.push(0);
+
+        let char_ints = num_ints_in_bytes(char_data.len());
+        let ih_ints = 5 + 1 + char_ints; // 5 PD fields + 1 alignment + char data
+        let ih_longs = num_longs_in_ints(ih_ints);
+
+        let mut ih_i32 = vec![0i32; ih_ints];
+        ih_i32[0] = n_ord as i32;
+        ih_i32[1] = n_curves as i32;
+        ih_i32[2] = 1; // boolIndependentIsXaxis
+        ih_i32[3] = 0; // labelsLength (set below if labels provided)
+        ih_i32[4] = 0; // precision (0 = default)
+        ih_i32[5] = 0x20202020u32 as i32; // blank pad
+
+        // Build labels as null-separated string
+        let label_bytes = if let Some(labs) = labels {
+            let mut lb = Vec::new();
+            for l in labs {
+                lb.extend_from_slice(l.as_bytes());
+                lb.push(0);
+            }
+            ih_i32[3] = lb.len() as i32;
+            lb
+        } else {
+            Vec::new()
+        };
+        let h2_ints = num_ints_in_bytes(label_bytes.len());
+        let h2_longs = num_longs_in_ints(h2_ints);
+
+        // Pack char data into internal header at position 6+
+        for (i, chunk) in char_data.chunks(4).enumerate() {
+            let mut b = [0u8; 4];
+            b[..chunk.len()].copy_from_slice(chunk);
+            if 6 + i < ih_i32.len() {
+                ih_i32[6 + i] = i32::from_le_bytes(b);
+            }
+        }
+
+        // Pack i32 into i64 words
+        let mut ih_words = vec![0i64; ih_longs];
+        for (i, chunk) in ih_i32.chunks(2).enumerate() {
+            let low = chunk[0];
+            let high = if chunk.len() > 1 { chunk[1] } else { 0 };
+            ih_words[i] = dss_io::pack_i4(low, high);
+        }
+
+        // Ordinates and values as i64 words
+        let v1_longs = n_ord;
+        let v1_ints = n_ord * 2;
+        let v1_words: Vec<i64> = ordinates.iter().map(|&v| i64::from_le_bytes(v.to_le_bytes())).collect();
+
+        let v2_longs = values.len();
+        let v2_ints = values.len() * 2;
+        let v2_words: Vec<i64> = values.iter().map(|&v| i64::from_le_bytes(v.to_le_bytes())).collect();
+
+        // Layout
+        let path_longs = num_longs_in_bytes(path_bytes.len());
+        let info_size = ri::PATHNAME + path_longs;
+        let total = info_size + ih_longs + h2_longs + v1_longs + v2_longs;
+
+        let base = self.file_size();
+        let info_addr = base;
+        let ih_addr = base + info_size as i64;
+        let h2_addr = ih_addr + ih_longs as i64;
+        let v1_addr = h2_addr + h2_longs as i64;
+        let v2_addr = v1_addr + v1_longs as i64;
+        let new_eof = base + total as i64;
+
+        let ph = hash::pathname_hash(path_bytes);
+        let th = hash::table_hash(path_bytes, self.max_hash());
+        let now = current_time_millis();
+
+        // Info block
+        let mut info = vec![0i64; info_size];
+        info[ri::FLAG] = keys::DSS_INFO_FLAG;
+        info[ri::STATUS] = keys::record_status::PRIMARY;
+        info[ri::PATHNAME_LENGTH] = path_bytes.len() as i64;
+        info[ri::HASH] = ph;
+        info[ri::TYPE_VERSION] = dss_io::pack_i4(dt::PDD, 1);
+        info[ri::LAST_WRITE_TIME] = now;
+        info[ri::CREATION_TIME] = now;
+        info[ri::INTERNAL_HEAD_ADDRESS] = ih_addr;
+        info[ri::INTERNAL_HEAD_NUMBER] = ih_ints as i64;
+        if h2_ints > 0 {
+            info[ri::HEADER2_ADDRESS] = h2_addr;
+            info[ri::HEADER2_NUMBER] = h2_ints as i64;
+        }
+        info[ri::VALUES1_ADDRESS] = v1_addr;
+        info[ri::VALUES1_NUMBER] = v1_ints as i64;
+        info[ri::VALUES2_ADDRESS] = v2_addr;
+        info[ri::VALUES2_NUMBER] = v2_ints as i64;
+        info[ri::ALLOCATED_SIZE] = (total * 2) as i64;
+        info[ri::NUMBER_DATA] = (n_ord * n_curves) as i64;
+        info[ri::LOGICAL_NUMBER] = (n_ord * n_curves) as i64;
+        let pw = bytes_to_words(path_bytes);
+        info[ri::PATHNAME..ri::PATHNAME + pw.len()].copy_from_slice(&pw);
+        write_words(&mut self.file, info_addr, &info)?;
+
+        // Internal header
+        write_words(&mut self.file, ih_addr, &ih_words)?;
+
+        // Labels (header2)
+        if !label_bytes.is_empty() {
+            let mut h2 = bytes_to_words(&label_bytes);
+            h2.resize(h2_longs, 0);
+            write_words(&mut self.file, h2_addr, &h2)?;
+        }
+
+        // Ordinates (values1)
+        write_words(&mut self.file, v1_addr, &v1_words)?;
+
+        // Curve values (values2)
+        write_words(&mut self.file, v2_addr, &v2_words)?;
+
+        // EOF
+        write_words(&mut self.file, new_eof, &[keys::DSS_END_FILE_FLAG])?;
+
+        // Bin + hash table
+        self.write_bin_entry(pathname, ph, th, info_addr, dt::PDD, now)?;
+
+        // Header update
+        self.header[fh::NUMBER_RECORDS] += 1;
+        self.header[fh::FILE_SIZE] = new_eof;
+        self.header[fh::LAST_WRITE_TIME] = now;
+        write_words(&mut self.file, 0, &self.header)?;
+        self.file.flush()
+    }
+
+    // -----------------------------------------------------------------------
     // Private helpers
     // -----------------------------------------------------------------------
 
@@ -816,6 +976,33 @@ mod tests {
             assert!((ts.values[0] - 1.0).abs() < 0.001);
             assert!((ts.values[4] - 5.0).abs() < 0.001);
             assert_eq!(ts.record_type, 105); // RTD
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_write_and_read_pd() {
+        let p = temp_path("pd_rt");
+        let _ = std::fs::remove_file(&p);
+        {
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            d.write_pd(
+                "/A/B/FREQ-FLOW///RUST/",
+                &[1.0, 5.0, 10.0],
+                &[100.0, 500.0, 1000.0],
+                1,
+                "PERCENT", "CFS",
+                None,
+            ).unwrap();
+        }
+        {
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            assert_eq!(d.record_count(), 1);
+            let pd = d.read_pd("/A/B/FREQ-FLOW///RUST/").unwrap().unwrap();
+            assert_eq!(pd.number_ordinates, 3);
+            assert_eq!(pd.number_curves, 1);
+            assert!((pd.ordinates[0] - 1.0).abs() < 0.001);
+            assert!((pd.values[0] - 100.0).abs() < 0.001);
         }
         let _ = std::fs::remove_file(&p);
     }
