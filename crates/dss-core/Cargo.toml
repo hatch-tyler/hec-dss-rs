@@ -1,9 +1,12 @@
 [package]
 name = "dss-core"
-description = "Safe Rust interface for HEC-DSS version 7 files"
+description = "Pure Rust implementation of HEC-DSS version 7 file format"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository = "https://github.com/hatch-tyler/hec-dss-rs"
+keywords = ["hec-dss", "hydrology", "dss", "usace", "water-resources"]
+categories = ["science", "parser-implementations"]
 
 [dependencies]
 dss-sys = { path = "../dss-sys" }

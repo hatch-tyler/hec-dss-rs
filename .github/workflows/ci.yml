@@ -10,25 +10,21 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Full build + test with C library cross-validation (Windows only)
   build-and-test:
-    name: Build & Test (Windows)
+    name: Full Test (Windows)
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      # Build the C library for cross-validation tests
       - name: Checkout hec-dss C library
         uses: actions/checkout@v4
         with:
@@ -45,43 +41,82 @@ jobs:
         env:
           HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
 
-      - name: Run tests
+      - name: Run all tests
         run: cargo test --release
         env:
           HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
           PATH: ${{ github.workspace }}/hec-dss-c/build/heclib/hecdss/Release;${{ env.PATH }}
 
-      - name: Upload DLL artifact
+      - name: Upload Windows DLL
         uses: actions/upload-artifact@v4
         with:
           name: dss_ffi-windows-x64
           path: target/release/dss_ffi.dll
 
+  # Pure Rust build + unit tests on all platforms
   build-pure-rust:
-    name: Build Pure Rust (no C dependency)
+    name: Pure Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Build dss-core and dss-ffi
         run: cargo build -p dss-core -p dss-ffi --release
 
-      - name: Run dss-core unit tests (no cross-validation)
+      - name: Run dss-core unit tests
         run: cargo test -p dss-core --lib
 
+      - name: Upload shared library
+        uses: actions/upload-artifact@v4
+        with:
+          name: dss_ffi-${{ matrix.os }}
+          path: |
+            target/release/dss_ffi.dll
+            target/release/libdss_ffi.so
+            target/release/libdss_ffi.dylib
+
+  # Clippy on all pure Rust crates
   clippy:
     name: Clippy
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Clippy (dss-core, dss-ffi)
+      - name: Clippy
         run: cargo clippy -p dss-core -p dss-ffi -- -D warnings
+
+  # Python wheel builds
+  python-wheels:
+    name: Python Wheel (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build wheel
+        run: maturin build --release -m crates/dss-python/Cargo.toml
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: target/wheels/*.whl
