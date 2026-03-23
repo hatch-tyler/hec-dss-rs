@@ -1,0 +1,14 @@
+[package]
+name = "dss-convert"
+description = "DSS v6 to v7 conversion tool"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "dss-convert"
+path = "src/main.rs"
+
+[dependencies]
+dss-core = { path = "../dss-core" }
+dss-sys = { path = "../dss-sys" }
