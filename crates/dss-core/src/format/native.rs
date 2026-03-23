@@ -252,6 +252,58 @@ impl NativeDssFile {
         bin::find_pathname(&mut self.file, hts, th, ph, pathname, bs)
     }
 
+    /// Get the record type code for a pathname. Returns 0 if not found.
+    pub fn record_type(&mut self, pathname: &str) -> io::Result<i32> {
+        match self.read_record_info(pathname)? {
+            Some(info) => Ok(info.data_type()),
+            None => Ok(0),
+        }
+    }
+
+    /// Delete a record by marking its bin entry as DELETED.
+    pub fn delete(&mut self, pathname: &str) -> io::Result<()> {
+        let _entry = match self.find_record(pathname)? {
+            Some(e) => e,
+            None => return Err(io::Error::new(io::ErrorKind::NotFound, "Record not found")),
+        };
+
+        // Read the bin entry and update status to DELETED
+        let mh = self.max_hash();
+        let ph = hash::pathname_hash(pathname.as_bytes());
+        let th = hash::table_hash(pathname.as_bytes(), mh);
+        let hts = self.hash_table_start();
+        let bin_addr = dss_io::read_word(&mut self.file, hts + th as i64)?;
+        if bin_addr <= 0 {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Bin not found"));
+        }
+
+        // Find the entry within the bin and overwrite its status
+        let bs = self.bin_size() as usize;
+        let block = dss_io::read_words(&mut self.file, bin_addr, bs)?;
+
+        let mut pos = 0;
+        let _path_upper = pathname.to_uppercase();
+        while pos + bk::FIXED_SIZE <= bs {
+            let h = block[pos + bk::HASH];
+            if h == 0 { break; }
+            let (_pb, pw) = dss_io::unpack_i4(block[pos + bk::PATH_LEN]);
+            if h == ph {
+                // Write DELETED status at the bin entry's status word
+                let status_addr = bin_addr + (pos + bk::STATUS) as i64;
+                write_words(&mut self.file, status_addr, &[keys::record_status::DELETED])?;
+
+                // Update header
+                self.header[fh::NUMBER_DELETES] += 1;
+                write_words(&mut self.file, 0, &self.header)?;
+                self.file.flush()?;
+                return Ok(());
+            }
+            pos += bk::FIXED_SIZE + pw as usize;
+        }
+
+        Err(io::Error::new(io::ErrorKind::NotFound, "Record not found in bin"))
+    }
+
     /// Read the record info for a pathname. Returns None if not found.
     fn read_record_info(&mut self, pathname: &str) -> io::Result<Option<RecordInfo>> {
         let entry = match self.find_record(pathname)? {

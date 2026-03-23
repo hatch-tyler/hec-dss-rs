@@ -21,6 +21,7 @@ use std::ptr;
 use std::sync::Mutex;
 
 use dss_core::NativeDssFile;
+use dss_core::datetime;
 
 /// Opaque file handle exposed to C callers.
 /// Wraps NativeDssFile behind a Mutex for thread safety.
@@ -355,9 +356,14 @@ pub unsafe extern "C" fn hec_dss_pdStore(
 // Delete & Squeeze (stubs)
 // ---------------------------------------------------------------------------
 
-/// Delete a record (not yet implemented). Returns -1.
+/// Delete a record. Returns 0 on success, -1 on failure.
 #[no_mangle]
-pub unsafe extern "C" fn hec_dss_delete(_dss: *mut DssFileHandle, _pathname: *const c_char) -> c_int { -1 }
+pub unsafe extern "C" fn hec_dss_delete(dss: *mut DssFileHandle, pathname: *const c_char) -> c_int {
+    if dss.is_null() || pathname.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    match file.delete(cstr_to_str(pathname)) { Ok(()) => 0, Err(_) => -1 }
+}
 
 /// Squeeze (compact) a DSS file (not yet implemented). Returns 0.
 #[no_mangle]
@@ -367,33 +373,62 @@ pub unsafe extern "C" fn hec_dss_squeeze(_pathname: *const c_char) -> c_int { 0 
 // Date Utilities (stubs)
 // ---------------------------------------------------------------------------
 
-/// Convert date string to Julian day (not yet implemented). Returns 0.
+/// Convert a date string (e.g., "15MAR2020") to a DSS Julian date.
 #[no_mangle]
-pub unsafe extern "C" fn hec_dss_dateToJulian(_date: *const c_char) -> c_int { 0 }
+pub unsafe extern "C" fn hec_dss_dateToJulian(date: *const c_char) -> c_int {
+    if date.is_null() { return 0; }
+    datetime::date_to_julian(cstr_to_str(date))
+}
 
-/// Convert Julian day to year/month/day (not yet implemented).
+/// Convert a Julian date to year, month, day.
 #[no_mangle]
 pub unsafe extern "C" fn hec_dss_julianToYearMonthDay(
-    _julian: c_int, _year: *mut c_int, _month: *mut c_int, _day: *mut c_int,
-) {}
+    julian: c_int, year: *mut c_int, month: *mut c_int, day: *mut c_int,
+) {
+    let (y, m, d) = datetime::julian_to_year_month_day(julian);
+    if !year.is_null() { *year = y; }
+    if !month.is_null() { *month = m; }
+    if !day.is_null() { *day = d; }
+}
 
-/// Convert date string to year/month/day (not yet implemented). Returns 0.
+/// Parse a date string into year, month, day. Returns 0 on success, -1 on failure.
 #[no_mangle]
 pub unsafe extern "C" fn hec_dss_dateToYearMonthDay(
-    _date: *const c_char, _year: *mut c_int, _month: *mut c_int, _day: *mut c_int,
-) -> c_int { 0 }
+    date: *const c_char, year: *mut c_int, month: *mut c_int, day: *mut c_int,
+) -> c_int {
+    if date.is_null() { return -1; }
+    match datetime::parse_date(cstr_to_str(date)) {
+        Some((y, m, d)) => {
+            if !year.is_null() { *year = y; }
+            if !month.is_null() { *month = m; }
+            if !day.is_null() { *day = d; }
+            0
+        }
+        None => -1,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Query Stubs
 // ---------------------------------------------------------------------------
 
-/// Get the DSS data type code for a pathname (not yet implemented). Returns 0.
+/// Get the DSS data type code for a pathname. Returns 0 if not found.
 #[no_mangle]
-pub unsafe extern "C" fn hec_dss_dataType(_dss: *mut DssFileHandle, _pathname: *const c_char) -> c_int { 0 }
+pub unsafe extern "C" fn hec_dss_dataType(dss: *mut DssFileHandle, pathname: *const c_char) -> c_int {
+    if dss.is_null() || pathname.is_null() { return 0; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle, mut);
+    file.record_type(cstr_to_str(pathname)).unwrap_or(0)
+}
 
-/// Get the record type code for a pathname (not yet implemented). Returns 0.
+/// Get the record type code for a pathname. Returns 0 if not found.
 #[no_mangle]
-pub unsafe extern "C" fn hec_dss_recordType(_dss: *mut DssFileHandle, _pathname: *const c_char) -> c_int { 0 }
+pub unsafe extern "C" fn hec_dss_recordType(dss: *mut DssFileHandle, pathname: *const c_char) -> c_int {
+    if dss.is_null() || pathname.is_null() { return 0; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle, mut);
+    file.record_type(cstr_to_str(pathname)).unwrap_or(0)
+}
 
 /// Get time series sizes for pre-allocation (not yet implemented). Returns 0.
 #[no_mangle]

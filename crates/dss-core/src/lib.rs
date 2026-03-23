@@ -27,3 +27,4 @@ pub use format::keys;
 pub use format::pathname::Pathname;
 pub use format::header::FileHeader;
 pub use format::native::{NativeDssFile, TimeSeriesRecord, PairedDataRecord};
+pub use format::datetime;
