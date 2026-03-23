@@ -1124,7 +1124,144 @@ impl NativeDssFile {
     }
 
     // -----------------------------------------------------------------------
-    // Time series write
+    // Multi-block time series
+    // -----------------------------------------------------------------------
+
+    /// Read time series across multiple blocks with time window filtering.
+    ///
+    /// Scans all D-part variants to collect data within the requested window.
+    /// The pathname's D-part is used as a template; E-part determines the block interval.
+    pub fn read_ts_window(
+        &mut self,
+        pathname: &str,
+        start_date: &str,
+        end_date: &str,
+    ) -> io::Result<Option<TimeSeriesRecord>> {
+        use super::datetime as dt_util;
+        use super::pathname::Pathname;
+
+        let parsed = Pathname::parse(pathname);
+        let e_part = parsed.e();
+
+        let (_interval_seconds, block_months) = dt_util::parse_interval(e_part)
+            .unwrap_or((3600, 1));
+
+        let start_julian = dt_util::date_to_julian(start_date);
+        let end_julian = dt_util::date_to_julian(end_date);
+        if start_julian == i32::MIN || end_julian == i32::MIN {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid date"));
+        }
+
+        let block_starts = dt_util::generate_block_starts(start_julian, end_julian, block_months);
+        if block_starts.is_empty() {
+            return Ok(None);
+        }
+
+        let mut all_values = Vec::new();
+        let mut units = String::new();
+        let mut dtype_str = String::new();
+        let mut record_type = 0i32;
+        let mut granularity = 0i32;
+
+        for &block_julian in &block_starts {
+            let d_part = dt_util::julian_to_dpart(block_julian);
+            let block_path = Pathname::from_parts(
+                parsed.a(), parsed.b(), parsed.c(),
+                &d_part, parsed.e(), parsed.f(),
+            );
+
+            if let Some(ts) = self.read_ts(&block_path.full)? {
+                if units.is_empty() {
+                    units = ts.units.clone();
+                    dtype_str = ts.data_type_str.clone();
+                    record_type = ts.record_type;
+                    granularity = ts.time_granularity;
+                }
+                all_values.extend_from_slice(&ts.values);
+            }
+        }
+
+        if all_values.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(TimeSeriesRecord {
+            pathname: pathname.to_string(),
+            values: all_values,
+            times: Vec::new(),
+            quality: None,
+            units,
+            data_type_str: dtype_str,
+            record_type,
+            time_granularity: granularity,
+            precision: 0,
+            block_start: 0,
+            block_end: 0,
+            number_values: 0, // set by caller from actual values.len()
+        }))
+    }
+
+    /// Write time series data spanning multiple blocks.
+    ///
+    /// Splits values into blocks based on the E-part interval and writes
+    /// each block as a separate record with the appropriate D-part.
+    pub fn write_ts_multi(
+        &mut self,
+        pathname: &str,
+        values: &[f64],
+        start_date: &str,
+        interval_seconds: i32,
+        units: &str,
+        data_type_str: &str,
+    ) -> io::Result<()> {
+        use super::datetime as dt_util;
+        use super::pathname::Pathname;
+
+        validate_pathname(pathname)?;
+        if values.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Values array is empty"));
+        }
+
+        let parsed = Pathname::parse(pathname);
+        let e_part = parsed.e();
+        let (_, block_months) = dt_util::parse_interval(e_part)
+            .unwrap_or((interval_seconds, 1));
+
+        let start_julian = dt_util::date_to_julian(start_date);
+        if start_julian == i32::MIN {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid start date"));
+        }
+
+        // Determine total duration in days and generate blocks
+        let total_seconds = values.len() as i64 * interval_seconds as i64;
+        let end_julian = start_julian + (total_seconds / 86400) as i32 + 1;
+
+        let block_starts = dt_util::generate_block_starts(start_julian, end_julian, block_months);
+
+        let mut pos = 0usize;
+        for &block_julian in &block_starts {
+            let block_values = dt_util::values_in_block(block_julian, interval_seconds, block_months) as usize;
+            let end_pos = (pos + block_values).min(values.len());
+            if pos >= values.len() { break; }
+
+            let chunk = &values[pos..end_pos];
+            if chunk.is_empty() { continue; }
+
+            let d_part = dt_util::julian_to_dpart(block_julian);
+            let block_path = Pathname::from_parts(
+                parsed.a(), parsed.b(), parsed.c(),
+                &d_part, parsed.e(), parsed.f(),
+            );
+
+            self.write_ts(&block_path.full, chunk, units, data_type_str)?;
+            pos = end_pos;
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Time series write (single block)
     // -----------------------------------------------------------------------
 
     /// Write a regular time series record (single block, double precision).
@@ -2507,6 +2644,40 @@ mod tests {
         ).unwrap();
         assert_eq!(d.record_count(), 1);
         assert_eq!(d.record_type("/A/B/STAGE//IR-MONTH/OBS/").unwrap(), 115); // ITD
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_multi_block_ts_write_read() {
+        let p = temp_path("multi_block");
+        let _ = std::fs::remove_file(&p);
+
+        // Write 2000 hourly values spanning ~83 days (Jan + Feb + part of Mar)
+        let values: Vec<f64> = (0..2000).map(|i| i as f64 * 0.5).collect();
+        {
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            d.write_ts_multi(
+                "/BASIN/LOC/FLOW/01JAN2020/1HOUR/MULTI/",
+                &values, "01JAN2020", 3600, "CFS", "INST-VAL",
+            ).unwrap();
+        }
+        {
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            // Should have multiple block records
+            let cat = d.catalog().unwrap();
+            assert!(cat.len() >= 2, "Expected multiple blocks, got {}", cat.len());
+
+            // Read back across blocks
+            let ts = d.read_ts_window(
+                "/BASIN/LOC/FLOW/01JAN2020/1HOUR/MULTI/",
+                "01JAN2020", "15MAR2020",
+            ).unwrap();
+            assert!(ts.is_some(), "Should find multi-block TS");
+            let ts = ts.unwrap();
+            assert!(ts.values.len() >= 1000, "Expected >= 1000 values, got {}", ts.values.len());
+            // First value should match
+            assert!((ts.values[0] - 0.0).abs() < 0.001);
+        }
         let _ = std::fs::remove_file(&p);
     }
 

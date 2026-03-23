@@ -106,6 +106,28 @@ impl DssFile {
         ).map_err(io_err)
     }
 
+    /// Read time series across multiple blocks with time window filtering.
+    fn read_ts_window<'py>(&mut self, py: Python<'py>, pathname: &str,
+        start_date: &str, end_date: &str,
+    ) -> PyResult<Option<Bound<'py, PyArray1<f64>>>> {
+        match self.get_mut()?.read_ts_window(pathname, start_date, end_date).map_err(io_err)? {
+            Some(ts) => Ok(Some(PyArray1::from_vec(py, ts.values))),
+            None => Ok(None),
+        }
+    }
+
+    /// Write time series spanning multiple blocks.
+    fn write_ts_multi(
+        &mut self, pathname: &str,
+        values: &Bound<'_, PyArray1<f64>>,
+        start_date: &str, interval_seconds: i32,
+        units: &str, data_type: &str,
+    ) -> PyResult<()> {
+        self.get_mut()?.write_ts_multi(
+            pathname, &values.to_vec()?, start_date, interval_seconds, units, data_type,
+        ).map_err(io_err)
+    }
+
     /// Get time series sizes for pre-allocation. Returns (number_values, quality_element_size).
     fn ts_get_sizes(&mut self, pathname: &str) -> PyResult<(i32, i32)> {
         self.get_mut()?.ts_get_sizes(pathname).map_err(io_err)

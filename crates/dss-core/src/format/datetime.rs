@@ -182,6 +182,101 @@ pub fn date_to_julian(date_str: &str) -> i32 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Interval / block mapping for multi-block time series
+// ---------------------------------------------------------------------------
+
+/// Parse an E-part interval string to seconds and block size.
+/// Returns (interval_seconds, block_months).
+/// block_months: 1 = monthly blocks, 12 = yearly blocks.
+pub fn parse_interval(e_part: &str) -> Option<(i32, i32)> {
+    let upper = e_part.to_uppercase();
+    match upper.as_str() {
+        "1MIN" | "1MINUTE" => Some((60, 1)),
+        "2MIN" => Some((120, 1)),
+        "3MIN" => Some((180, 1)),
+        "5MIN" => Some((300, 1)),
+        "6MIN" => Some((360, 1)),
+        "10MIN" => Some((600, 1)),
+        "15MIN" => Some((900, 1)),
+        "20MIN" => Some((1200, 1)),
+        "30MIN" => Some((1800, 1)),
+        "1HOUR" => Some((3600, 1)),
+        "2HOUR" => Some((7200, 1)),
+        "3HOUR" => Some((10800, 1)),
+        "4HOUR" => Some((14400, 1)),
+        "6HOUR" => Some((21600, 1)),
+        "8HOUR" => Some((28800, 1)),
+        "12HOUR" => Some((43200, 1)),
+        "1DAY" => Some((86400, 12)),
+        "1WEEK" => Some((604800, 12)),
+        "1MON" | "1MONTH" => Some((0, 120)),  // variable interval, decade blocks
+        "1YEAR" => Some((0, 1200)),            // century blocks
+        _ => None,
+    }
+}
+
+/// Format a Julian date as a DSS D-part string (e.g., "01Jan2020").
+pub fn julian_to_dpart(julian: i32) -> String {
+    let (y, m, d) = julian_to_year_month_day(julian);
+    if !(1..=12).contains(&m) { return String::new(); }
+    format!("{:02}{}{}", d, MONTH_NAMES[(m - 1) as usize], y)
+}
+
+/// Get the Julian date of the first day of the month containing the given Julian date.
+pub fn block_start_monthly(julian: i32) -> i32 {
+    let (y, m, _) = julian_to_year_month_day(julian);
+    year_month_day_to_julian(y, m, 1)
+}
+
+/// Get the Julian date of the first day of the year containing the given Julian date.
+pub fn block_start_yearly(julian: i32) -> i32 {
+    let (y, _, _) = julian_to_year_month_day(julian);
+    year_month_day_to_julian(y, 1, 1)
+}
+
+/// Generate block start Julian dates between two dates for a given block size.
+pub fn generate_block_starts(start_julian: i32, end_julian: i32, block_months: i32) -> Vec<i32> {
+    let mut blocks = Vec::new();
+    let (mut y, mut m, _) = julian_to_year_month_day(start_julian);
+
+    // Align to block boundary
+    if block_months <= 1 {
+        // monthly: already aligned by month
+    } else if block_months <= 12 {
+        m = 1; // yearly: align to January
+    } else {
+        m = 1;
+        y = y - (y % 10); // decade: align to decade start
+    }
+
+    loop {
+        let block_julian = year_month_day_to_julian(y, m, 1);
+        if block_julian > end_julian { break; }
+        if block_julian >= start_julian - 31 * block_months { // allow one block before start
+            blocks.push(block_julian);
+        }
+        m += block_months;
+        while m > 12 {
+            m -= 12;
+            y += 1;
+        }
+    }
+    blocks
+}
+
+/// Number of values in a time block for a given interval.
+/// For monthly blocks with hourly data: days_in_month * 24.
+pub fn values_in_block(block_julian: i32, interval_seconds: i32, block_months: i32) -> i32 {
+    if interval_seconds <= 0 { return 0; }
+    let (y, m, _) = julian_to_year_month_day(block_julian);
+    let next_m = m + block_months;
+    let (ny, nm) = if next_m > 12 { (y + 1, next_m - 12) } else { (y, next_m) };
+    let next_julian = year_month_day_to_julian(ny, nm, 1);
+    let days = next_julian - block_julian;
+    (days as i64 * 86400 / interval_seconds as i64) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -244,6 +339,39 @@ mod tests {
 
         assert_eq!(date_to_julian(""), i32::MIN);
         assert_eq!(date_to_julian("garbage"), i32::MIN);
+    }
+
+    #[test]
+    fn test_parse_interval() {
+        assert_eq!(parse_interval("1HOUR"), Some((3600, 1)));
+        assert_eq!(parse_interval("1DAY"), Some((86400, 12)));
+        assert_eq!(parse_interval("15MIN"), Some((900, 1)));
+        assert!(parse_interval("UNKNOWN").is_none());
+    }
+
+    #[test]
+    fn test_julian_to_dpart() {
+        let j = year_month_day_to_julian(2020, 1, 1);
+        let dp = julian_to_dpart(j);
+        assert_eq!(dp, "01JAN2020");
+    }
+
+    #[test]
+    fn test_values_in_block() {
+        // January 2020: 31 days * 24 hours = 744
+        let jan = year_month_day_to_julian(2020, 1, 1);
+        assert_eq!(values_in_block(jan, 3600, 1), 744);
+        // February 2020 (leap): 29 * 24 = 696
+        let feb = year_month_day_to_julian(2020, 2, 1);
+        assert_eq!(values_in_block(feb, 3600, 1), 696);
+    }
+
+    #[test]
+    fn test_generate_block_starts() {
+        let start = year_month_day_to_julian(2020, 1, 15);
+        let end = year_month_day_to_julian(2020, 4, 15);
+        let blocks = generate_block_starts(start, end, 1);
+        assert!(blocks.len() >= 3); // Jan, Feb, Mar, Apr
     }
 
     #[test]
