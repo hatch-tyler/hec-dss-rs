@@ -349,6 +349,68 @@ impl NativeDssFile {
         Ok((num_values, quality_elem))
     }
 
+    /// Get basic time series info (units and data type) without reading values.
+    pub fn ts_retrieve_info(&mut self, pathname: &str) -> io::Result<Option<(String, String)>> {
+        let info = match self.read_record_info(pathname)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let rtype = info.data_type();
+        if !dt::is_time_series(rtype) {
+            return Ok(None);
+        }
+        let ih = self.read_internal_header(&info)?;
+        let units = if ih.len() > tsh::UNITS + 1 {
+            extract_string_from_i32s(&ih[tsh::UNITS..])
+        } else { String::new() };
+
+        // Split "UNITS\0TYPE" pattern
+        let (u, t) = if let Some(pos) = units.find('\0') {
+            (units[..pos].to_string(), units[pos+1..].trim_matches('\0').to_string())
+        } else {
+            (units, String::new())
+        };
+        Ok(Some((u, t)))
+    }
+
+    /// Get paired data info (sizes and units) without reading values.
+    pub fn pd_retrieve_info(&mut self, pathname: &str) -> io::Result<Option<(i32, i32, String, String)>> {
+        let info = match self.read_record_info(pathname)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let rtype = info.data_type();
+        if !matches!(rtype, 200..=209) {
+            return Ok(None);
+        }
+        let ih = self.read_internal_header(&info)?;
+        let n_ord = ih.first().copied().unwrap_or(0);
+        let n_curves = ih.get(1).copied().unwrap_or(0);
+        let labels_len = ih.get(3).copied().unwrap_or(0);
+        let _ = labels_len; // available but not returned here
+
+        let units_str = if ih.len() > 5 {
+            extract_string_from_i32s(&ih[5..])
+        } else { String::new() };
+        let (ui, ud) = if let Some(pos) = units_str.find('\0') {
+            (units_str[..pos].to_string(), units_str[pos+1..].trim_matches('\0').to_string())
+        } else {
+            (units_str, String::new())
+        };
+        Ok(Some((n_ord, n_curves, ui, ud)))
+    }
+
+    /// Get the date/time range of a time series record.
+    /// Returns (first_julian, first_seconds, last_julian, last_seconds).
+    pub fn ts_get_date_time_range(&mut self, pathname: &str) -> io::Result<Option<(i32, i32, i32, i32)>> {
+        let entry = match self.find_record(pathname)? {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        // The bin entry stores packed dates
+        Ok(Some((entry.first_date, 0, entry.last_date, 0)))
+    }
+
     /// Squeeze (compact) the DSS file by copying all live records to a new file.
     ///
     /// Creates a new file, copies all non-deleted records, then replaces the

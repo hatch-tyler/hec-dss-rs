@@ -423,7 +423,203 @@ pub unsafe extern "C" fn hec_dss_dateToYearMonthDay(
 }
 
 // ---------------------------------------------------------------------------
-// Query Stubs
+// Additional TS/PD info functions
+// ---------------------------------------------------------------------------
+
+/// Get basic time series info (units and type) without reading values.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_tsRetrieveInfo(
+    dss: *mut DssFileHandle, pathname: *const c_char,
+    units: *mut c_char, units_length: c_int,
+    data_type: *mut c_char, type_length: c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    match file.ts_retrieve_info(cstr_to_str(pathname)) {
+        Ok(Some((u, t))) => {
+            if !units.is_null() { copy_to_c_buf(&u, units, units_length); }
+            if !data_type.is_null() { copy_to_c_buf(&t, data_type, type_length); }
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Get the date/time range of a time series. Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_tsGetDateTimeRange(
+    dss: *mut DssFileHandle, pathname: *const c_char, _bool_full_set: c_int,
+    first_julian: *mut c_int, first_seconds: *mut c_int,
+    last_julian: *mut c_int, last_seconds: *mut c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    match file.ts_get_date_time_range(cstr_to_str(pathname)) {
+        Ok(Some((fj, fs, lj, ls))) => {
+            if !first_julian.is_null() { *first_julian = fj; }
+            if !first_seconds.is_null() { *first_seconds = fs; }
+            if !last_julian.is_null() { *last_julian = lj; }
+            if !last_seconds.is_null() { *last_seconds = ls; }
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Calculate number of periods between two dates for a given interval.
+#[no_mangle]
+pub extern "C" fn hec_dss_numberPeriods(
+    interval_seconds: c_int,
+    julian_start: c_int, start_seconds: c_int,
+    julian_end: c_int, end_seconds: c_int,
+) -> c_int {
+    if interval_seconds <= 0 { return 0; }
+    let start_total = (julian_start as i64) * 86400 + start_seconds as i64;
+    let end_total = (julian_end as i64) * 86400 + end_seconds as i64;
+    let diff = end_total - start_total;
+    if diff <= 0 { return 0; }
+    (diff / interval_seconds as i64) as c_int
+}
+
+/// Get paired data info (sizes and units) without reading values.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_pdRetrieveInfo(
+    dss: *mut DssFileHandle, pathname: *const c_char,
+    number_ordinates: *mut c_int, number_curves: *mut c_int,
+    units_independent: *mut c_char, units_independent_length: c_int,
+    units_dependent: *mut c_char, units_dependent_length: c_int,
+    _type_independent: *mut c_char, _type_independent_length: c_int,
+    _type_dependent: *mut c_char, _type_dependent_length: c_int,
+    _labels_length: *mut c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    match file.pd_retrieve_info(cstr_to_str(pathname)) {
+        Ok(Some((no, nc, ui, ud))) => {
+            if !number_ordinates.is_null() { *number_ordinates = no; }
+            if !number_curves.is_null() { *number_curves = nc; }
+            if !units_independent.is_null() { copy_to_c_buf(&ui, units_independent, units_independent_length); }
+            if !units_dependent.is_null() { copy_to_c_buf(&ud, units_dependent, units_dependent_length); }
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Retrieve paired data into pre-allocated arrays. Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_pdRetrieve(
+    dss: *mut DssFileHandle, pathname: *const c_char,
+    double_ordinates: *mut c_double, double_ordinates_length: c_int,
+    double_values: *mut c_double, double_values_length: c_int,
+    number_ordinates: *mut c_int, number_curves: *mut c_int,
+    _units_independent: *mut c_char, _units_independent_length: c_int,
+    _type_independent: *mut c_char, _type_independent_length: c_int,
+    _units_dependent: *mut c_char, _units_dependent_length: c_int,
+    _type_dependent: *mut c_char, _type_dependent_length: c_int,
+    _labels: *mut c_char, _labels_length: c_int,
+    _time_zone_name: *mut c_char, _time_zone_name_length: c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() || double_ordinates.is_null() || double_values.is_null() {
+        return -1;
+    }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    match file.read_pd(cstr_to_str(pathname)) {
+        Ok(Some(pd)) => {
+            let no = pd.ordinates.len().min(double_ordinates_length as usize);
+            let nv = pd.values.len().min(double_values_length as usize);
+            ptr::copy_nonoverlapping(pd.ordinates.as_ptr(), double_ordinates, no);
+            ptr::copy_nonoverlapping(pd.values.as_ptr(), double_values, nv);
+            if !number_ordinates.is_null() { *number_ordinates = pd.number_ordinates as c_int; }
+            if !number_curves.is_null() { *number_curves = pd.number_curves as c_int; }
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Store an array record. Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_arrayStore(
+    dss: *mut DssFileHandle, pathname: *const c_char,
+    int_values: *mut c_int, int_values_length: c_int,
+    float_values: *mut f32, float_values_length: c_int,
+    double_values: *mut c_double, double_values_length: c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    let ints = if !int_values.is_null() && int_values_length > 0 {
+        std::slice::from_raw_parts(int_values, int_values_length as usize)
+    } else { &[] };
+    let floats = if !float_values.is_null() && float_values_length > 0 {
+        std::slice::from_raw_parts(float_values, float_values_length as usize)
+    } else { &[] };
+    let doubles = if !double_values.is_null() && double_values_length > 0 {
+        std::slice::from_raw_parts(double_values, double_values_length as usize)
+    } else { &[] };
+    match file.write_array(cstr_to_str(pathname), ints, floats, doubles) {
+        Ok(()) => 0, Err(_) => -1,
+    }
+}
+
+/// Get array sizes for pre-allocation. Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_arrayRetrieveInfo(
+    dss: *mut DssFileHandle, pathname: *const c_char,
+    int_values_read: *mut c_int, float_values_read: *mut c_int, double_values_read: *mut c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    match file.read_array(cstr_to_str(pathname)) {
+        Ok(Some(arr)) => {
+            if !int_values_read.is_null() { *int_values_read = arr.int_values.len() as c_int; }
+            if !float_values_read.is_null() { *float_values_read = arr.float_values.len() as c_int; }
+            if !double_values_read.is_null() { *double_values_read = arr.double_values.len() as c_int; }
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Retrieve array data into pre-allocated arrays. Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_arrayRetrieve(
+    dss: *mut DssFileHandle, pathname: *const c_char,
+    int_values: *mut c_int, int_values_length: c_int,
+    float_values: *mut f32, float_values_length: c_int,
+    double_values: *mut c_double, double_values_length: c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    match file.read_array(cstr_to_str(pathname)) {
+        Ok(Some(arr)) => {
+            if !int_values.is_null() && int_values_length > 0 {
+                let n = arr.int_values.len().min(int_values_length as usize);
+                ptr::copy_nonoverlapping(arr.int_values.as_ptr(), int_values, n);
+            }
+            if !float_values.is_null() && float_values_length > 0 {
+                let n = arr.float_values.len().min(float_values_length as usize);
+                ptr::copy_nonoverlapping(arr.float_values.as_ptr(), float_values, n);
+            }
+            if !double_values.is_null() && double_values_length > 0 {
+                let n = arr.double_values.len().min(double_values_length as usize);
+                ptr::copy_nonoverlapping(arr.double_values.as_ptr(), double_values, n);
+            }
+            0
+        }
+        _ => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Query functions
 // ---------------------------------------------------------------------------
 
 /// Get the DSS data type code for a pathname. Returns 0 if not found.
