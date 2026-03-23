@@ -54,40 +54,31 @@ fn bytes_to_words(bytes: &[u8]) -> Vec<i64> {
     words
 }
 
-/// Decode f64 values from raw LE bytes.
+/// Decode f64 values from raw LE bytes (optimized: no intermediate array per value).
 fn decode_f64s(raw: &[u8]) -> Vec<f64> {
-    raw.chunks(8)
-        .map(|c| {
-            let mut b = [0u8; 8];
-            let n = c.len().min(8);
-            b[..n].copy_from_slice(&c[..n]);
-            f64::from_le_bytes(b)
-        })
-        .collect()
+    let mut out = Vec::with_capacity(raw.len() / 8);
+    for chunk in raw.chunks_exact(8) {
+        out.push(f64::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    out
 }
 
 /// Decode f32 values from raw LE bytes, converting to f64.
 fn decode_f32s_as_f64(raw: &[u8]) -> Vec<f64> {
-    raw.chunks(4)
-        .map(|c| {
-            let mut b = [0u8; 4];
-            let n = c.len().min(4);
-            b[..n].copy_from_slice(&c[..n]);
-            f32::from_le_bytes(b) as f64
-        })
-        .collect()
+    let mut out = Vec::with_capacity(raw.len() / 4);
+    for chunk in raw.chunks_exact(4) {
+        out.push(f32::from_le_bytes(chunk.try_into().unwrap()) as f64);
+    }
+    out
 }
 
 /// Decode i32 values from raw LE bytes.
 fn decode_i32s(raw: &[u8]) -> Vec<i32> {
-    raw.chunks(4)
-        .map(|c| {
-            let mut b = [0u8; 4];
-            let n = c.len().min(4);
-            b[..n].copy_from_slice(&c[..n]);
-            i32::from_le_bytes(b)
-        })
-        .collect()
+    let mut out = Vec::with_capacity(raw.len() / 4);
+    for chunk in raw.chunks_exact(4) {
+        out.push(i32::from_le_bytes(chunk.try_into().unwrap()));
+    }
+    out
 }
 
 /// Extract a null-terminated string from a slice of i32 values.
@@ -100,6 +91,34 @@ fn extract_string_from_i32s(data: &[i32]) -> String {
         .trim_end_matches('\0')
         .trim()
         .to_string()
+}
+
+/// Validate a DSS pathname has the correct format: `/A/B/C/D/E/F/`
+/// Returns an error if the pathname is invalid.
+fn validate_pathname(pathname: &str) -> io::Result<()> {
+    if pathname.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Empty pathname"));
+    }
+    if pathname.len() > 393 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Pathname exceeds 393 bytes"));
+    }
+    if !pathname.starts_with('/') || !pathname.ends_with('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Pathname must start and end with '/'",
+        ));
+    }
+    let slash_count = pathname.bytes().filter(|&b| b == b'/').count();
+    if slash_count != 7 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("Pathname must have exactly 7 slashes (got {slash_count})"),
+        ));
+    }
+    if pathname.bytes().any(|b| b == 0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Pathname contains null byte"));
+    }
+    Ok(())
 }
 
 fn current_time_millis() -> i64 {
@@ -276,6 +295,7 @@ impl NativeDssFile {
 
     /// Write a text record.
     pub fn write_text(&mut self, pathname: &str, text: &str) -> io::Result<()> {
+        validate_pathname(pathname)?;
         let text_bytes = text.as_bytes();
         let path_bytes = pathname.as_bytes();
 
@@ -508,6 +528,10 @@ impl NativeDssFile {
         units: &str,
         data_type_str: &str,
     ) -> io::Result<()> {
+        validate_pathname(pathname)?;
+        if values.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Values array is empty"));
+        }
         let path_bytes = pathname.as_bytes();
         let n_values = values.len();
 
@@ -644,6 +668,13 @@ impl NativeDssFile {
         units_dependent: &str,
         labels: Option<&[&str]>,
     ) -> io::Result<()> {
+        validate_pathname(pathname)?;
+        if ordinates.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Ordinates array is empty"));
+        }
+        if values.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Values array is empty"));
+        }
         let path_bytes = pathname.as_bytes();
         let n_ord = ordinates.len();
 
@@ -829,7 +860,6 @@ impl NativeDssFile {
         let path_longs = num_longs_in_bytes(path_bytes.len());
         let entry_words = bk::FIXED_SIZE + path_longs;
         let bs = self.bin_size() as i64;
-        let bpb = self.bins_per_block() as i64;
 
         if entry_words > bs as usize {
             return Err(io::Error::new(

@@ -34,14 +34,16 @@ pub fn pathname_hash(pathname: &[u8]) -> i64 {
 /// chunks of `ibit` bits (where `2^ibit = max_hash`), XORing the chunks
 /// together to produce the final index.
 pub fn table_hash(pathname: &[u8], max_hash: i32) -> i32 {
-    // Prepare uppercased path with 8 null bytes appended
-    let mut path = Vec::with_capacity(pathname.len() + 8);
-    for &ch in pathname {
-        path.push(sanitize_char(ch));
+    // Prepare uppercased path with 8 null bytes appended.
+    // Stack array avoids heap allocation for typical pathnames (< 400 bytes).
+    let mut buf = [0u8; 408]; // MAX_PATHNAME_LENGTH + 8 + padding
+    let path_len = pathname.len().min(400);
+    for i in 0..path_len {
+        buf[i] = sanitize_char(pathname[i]);
     }
-    path.extend_from_slice(&[0u8; 8]);
+    let path = &buf[..path_len + 8]; // +8 zero padding already in place
 
-    let pathname_length = pathname.len();
+    let pathname_length = path_len;
 
     // Compute ibit = floor(log2(max_hash))
     // frexp returns (fraction, exponent) where fraction is in [0.5, 1.0)
