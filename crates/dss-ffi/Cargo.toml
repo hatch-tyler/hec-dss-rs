@@ -1,0 +1,12 @@
+[package]
+name = "dss-ffi"
+description = "C-compatible FFI export for HEC-DSS, drop-in replacement for hecdss.dll"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+dss-core = { path = "../dss-core" }

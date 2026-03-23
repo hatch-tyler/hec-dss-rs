@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/dss-sys",
     "crates/dss-core",
+    "crates/dss-ffi",
 ]
 
 [workspace.package]

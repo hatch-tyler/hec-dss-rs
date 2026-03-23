@@ -12,6 +12,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dss-ffi"
+version = "0.1.0"
+dependencies = [
+ "dss-core",
+]
+
+[[package]]
 name = "dss-sys"
 version = "0.1.0"
 
