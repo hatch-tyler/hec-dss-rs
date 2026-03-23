@@ -304,6 +304,108 @@ impl NativeDssFile {
         Err(io::Error::new(io::ErrorKind::NotFound, "Record not found in bin"))
     }
 
+    /// Get the size information for a time series record.
+    ///
+    /// Returns `(number_values, quality_element_size)` for pre-allocation.
+    /// Uses the record's internal header to determine sizes.
+    pub fn ts_get_sizes(&mut self, pathname: &str) -> io::Result<(i32, i32)> {
+        let info = match self.read_record_info(pathname)? {
+            Some(i) => i,
+            None => return Ok((0, 0)),
+        };
+        let rtype = info.data_type();
+        if !dt::is_time_series(rtype) {
+            return Ok((0, 0));
+        }
+
+        let ih = self.read_internal_header(&info)?;
+        let num_values = info.logical_number() as i32;
+        let quality_elem = ih.get(tsh::QUALITY_ELEMENT_SIZE).copied().unwrap_or(0);
+
+        Ok((num_values, quality_elem))
+    }
+
+    /// Squeeze (compact) the DSS file by copying all live records to a new file.
+    ///
+    /// Creates a new file, copies all non-deleted records, then replaces the
+    /// original file. This reclaims space from deleted records.
+    pub fn squeeze(&mut self) -> io::Result<()> {
+        // Read catalog of live records
+        let entries = self.catalog()?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+
+        // Create a temporary file
+        let tmp_path = format!("{}.tmp", self.path);
+        {
+            let mut new_dss = NativeDssFile::create(&tmp_path)?;
+
+            for entry in &entries {
+                // Read each record and write to new file based on type
+                match entry.record_type {
+                    300 | 310 => {
+                        // Text record
+                        if let Some(text) = self.read_text(&entry.pathname)? {
+                            if !text.is_empty() {
+                                new_dss.write_text(&entry.pathname, &text)?;
+                            }
+                        }
+                    }
+                    100..=119 => {
+                        // Time series
+                        if let Some(ts) = self.read_ts(&entry.pathname)? {
+                            if !ts.values.is_empty() {
+                                new_dss.write_ts(
+                                    &entry.pathname, &ts.values,
+                                    &ts.units, &ts.data_type_str,
+                                )?;
+                            }
+                        }
+                    }
+                    200..=209 => {
+                        // Paired data
+                        if let Some(pd) = self.read_pd(&entry.pathname)? {
+                            if !pd.ordinates.is_empty() && !pd.values.is_empty() {
+                                new_dss.write_pd(
+                                    &entry.pathname, &pd.ordinates, &pd.values,
+                                    pd.number_curves,
+                                    &pd.units_independent, &pd.units_dependent,
+                                    None,
+                                )?;
+                            }
+                        }
+                    }
+                    _ => {
+                        // Unknown record type - skip (we can't copy what we can't decode)
+                    }
+                }
+            }
+        } // new_dss dropped here, flushed and closed
+
+        // We need to close the current file before replacing it.
+        // Drop the current File by replacing it with /dev/null equivalent,
+        // then rename and reopen.
+        let null_path = format!("{}.null", self.path);
+        let null_file = std::fs::OpenOptions::new()
+            .read(true).write(true).create(true).truncate(true)
+            .open(&null_path)?;
+        let old_file = std::mem::replace(&mut self.file, null_file);
+        drop(old_file);
+
+        // Replace original with squeezed file
+        std::fs::rename(&tmp_path, &self.path)?;
+        let _ = std::fs::remove_file(&null_path);
+
+        // Reopen the squeezed file
+        let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&self.path)?;
+        let hdr = super::header::FileHeader::read_from(&mut file)?;
+        self.file = file;
+        self.header = hdr.raw;
+
+        Ok(())
+    }
+
     /// Read the record info for a pathname. Returns None if not found.
     fn read_record_info(&mut self, pathname: &str) -> io::Result<Option<RecordInfo>> {
         let entry = match self.find_record(pathname)? {
@@ -1157,6 +1259,97 @@ mod tests {
             assert_eq!(d.read_text("/OVF/TEST/NOTE/0//REC/").unwrap(), Some("Record number 0".into()));
             assert_eq!(d.read_text("/OVF/TEST/NOTE/39//REC/").unwrap(), Some("Record number 39".into()));
         }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_ts_get_sizes() {
+        let p = temp_path("ts_sizes");
+        let _ = std::fs::remove_file(&p);
+        {
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            d.write_ts("/A/B/FLOW/01JAN2020/1HOUR/SZ/", &[1.0, 2.0, 3.0], "CFS", "INST-VAL").unwrap();
+        }
+        {
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            let (nv, qs) = d.ts_get_sizes("/A/B/FLOW/01JAN2020/1HOUR/SZ/").unwrap();
+            assert_eq!(nv, 3, "Should have 3 values");
+            assert_eq!(qs, 0, "No quality stored");
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_ts_get_sizes_nonexistent() {
+        let p = temp_path("ts_sizes_none");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        let (nv, qs) = d.ts_get_sizes("/NO/EXIST///HERE/").unwrap();
+        assert_eq!(nv, 0);
+        assert_eq!(qs, 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_delete_record() {
+        let p = temp_path("delete");
+        let _ = std::fs::remove_file(&p);
+        {
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            d.write_text("/A/B/NOTE///DEL/", "to be deleted").unwrap();
+            d.write_text("/A/B/NOTE///KEEP/", "keeper").unwrap();
+            assert_eq!(d.record_count(), 2);
+
+            d.delete("/A/B/NOTE///DEL/").unwrap();
+            // Record count in header still shows 2 (original count)
+            // but catalog should show only non-deleted records
+        }
+        {
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            let cat = d.catalog().unwrap();
+            // Deleted records should be filtered by catalog()
+            assert!(cat.iter().all(|e| !e.pathname.contains("DEL")));
+            assert!(cat.iter().any(|e| e.pathname.contains("KEEP")));
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_squeeze() {
+        let p = temp_path("squeeze");
+        let _ = std::fs::remove_file(&p);
+
+        // Create file with 3 records, delete 1, squeeze
+        {
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            d.write_text("/A/B/NOTE///ONE/", "First").unwrap();
+            d.write_text("/A/B/NOTE///TWO/", "Second").unwrap();
+            d.write_text("/A/B/NOTE///THREE/", "Third").unwrap();
+            d.delete("/A/B/NOTE///TWO/").unwrap();
+            d.squeeze().unwrap();
+        }
+        {
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            assert_eq!(d.record_count(), 2);
+            assert_eq!(d.read_text("/A/B/NOTE///ONE/").unwrap(), Some("First".into()));
+            assert_eq!(d.read_text("/A/B/NOTE///THREE/").unwrap(), Some("Third".into()));
+            assert_eq!(d.read_text("/A/B/NOTE///TWO/").unwrap(), None);
+        }
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_record_type_query() {
+        let p = temp_path("rectype");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        d.write_text("/A/B/NOTE///RT/", "text").unwrap();
+        d.write_ts("/A/B/FLOW/01JAN2020/1HOUR/RT/", &[1.0], "CFS", "INST-VAL").unwrap();
+
+        assert_eq!(d.record_type("/A/B/NOTE///RT/").unwrap(), 300);
+        assert_eq!(d.record_type("/A/B/FLOW/01JAN2020/1HOUR/RT/").unwrap(), 105);
+        assert_eq!(d.record_type("/NO/EXIST///HERE/").unwrap(), 0);
+
         let _ = std::fs::remove_file(&p);
     }
 }

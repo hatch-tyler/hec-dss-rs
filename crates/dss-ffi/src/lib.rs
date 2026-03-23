@@ -365,9 +365,23 @@ pub unsafe extern "C" fn hec_dss_delete(dss: *mut DssFileHandle, pathname: *cons
     match file.delete(cstr_to_str(pathname)) { Ok(()) => 0, Err(_) => -1 }
 }
 
-/// Squeeze (compact) a DSS file (not yet implemented). Returns 0.
+/// Squeeze (compact) a DSS file, reclaiming space from deleted records.
+/// Opens the file, copies live records to a temp file, replaces original.
+/// Returns 0 on success.
 #[no_mangle]
-pub unsafe extern "C" fn hec_dss_squeeze(_pathname: *const c_char) -> c_int { 0 }
+pub unsafe extern "C" fn hec_dss_squeeze(pathname: *const c_char) -> c_int {
+    if pathname.is_null() { return -1; }
+    let path = cstr_to_str(pathname);
+    if path.is_empty() { return -1; }
+    // Open, squeeze, close
+    match NativeDssFile::open(path) {
+        Ok(mut dss) => match dss.squeeze() {
+            Ok(()) => 0,
+            Err(_) => -1,
+        },
+        Err(_) => -1,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Date Utilities (stubs)
@@ -430,11 +444,25 @@ pub unsafe extern "C" fn hec_dss_recordType(dss: *mut DssFileHandle, pathname: *
     file.record_type(cstr_to_str(pathname)).unwrap_or(0)
 }
 
-/// Get time series sizes for pre-allocation (not yet implemented). Returns 0.
+/// Get time series sizes for pre-allocation.
+/// Returns 0 on success, filling numberValues and qualityElementSize.
 #[no_mangle]
 pub unsafe extern "C" fn hec_dss_tsGetSizes(
-    _dss: *mut DssFileHandle, _pathname: *const c_char,
+    dss: *mut DssFileHandle, pathname: *const c_char,
     _start_date: *const c_char, _start_time: *const c_char,
     _end_date: *const c_char, _end_time: *const c_char,
-    _number_values: *mut c_int, _quality_element_size: *mut c_int,
-) -> c_int { 0 }
+    number_values: *mut c_int, quality_element_size: *mut c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    let pn = cstr_to_str(pathname);
+    match file.ts_get_sizes(pn) {
+        Ok((nv, qs)) => {
+            if !number_values.is_null() { *number_values = nv; }
+            if !quality_element_size.is_null() { *quality_element_size = qs; }
+            0
+        }
+        Err(_) => -1,
+    }
+}
