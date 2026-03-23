@@ -391,6 +391,104 @@ fn test_c_writes_ts_rust_reads() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// Write time series in pure Rust, then verify the C library can read it.
+#[test]
+fn test_rust_writes_ts_c_reads() {
+    use dss_core::NativeDssFile;
+
+    let path = std::env::temp_dir().join("cross_validate_ts_write.dss");
+    let _ = std::fs::remove_file(&path);
+
+    // Write via pure Rust
+    {
+        let mut dss = NativeDssFile::create(path.to_str().unwrap()).unwrap();
+        let values = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        dss.write_ts(
+            "/RUST/WROTE/FLOW/01JAN2020/1HOUR/NATIVE/",
+            &values,
+            "CFS",
+            "INST-VAL",
+        ).unwrap();
+    }
+
+    // Read via C library
+    let c_path = CString::new(path.to_str().unwrap()).unwrap();
+    unsafe {
+        use dss_sys::*;
+        let mut dss: *mut dss_file = std::ptr::null_mut();
+        let status = hec_dss_open(c_path.as_ptr(), &mut dss);
+        assert_eq!(status, 0, "C should open Rust-written TS file");
+
+        assert_eq!(hec_dss_record_count(dss), 1);
+
+        // Get sizes
+        let pathname = CString::new("/RUST/WROTE/FLOW/01JAN2020/1HOUR/NATIVE/").unwrap();
+        let sd = CString::new("01JAN2020").unwrap();
+        let st = CString::new("01:00").unwrap();
+        let ed = CString::new("01JAN2020").unwrap();
+        let et = CString::new("05:00").unwrap();
+
+        let mut nv: i32 = 0;
+        let mut qs: i32 = 0;
+        hec_dss_tsGetSizes(dss, pathname.as_ptr(),
+            sd.as_ptr(), st.as_ptr(), ed.as_ptr(), et.as_ptr(),
+            &mut nv, &mut qs);
+        assert!(nv > 0, "C should report >0 values, got {nv}");
+
+        // Retrieve
+        let n = nv as usize;
+        let mut times = vec![0i32; n];
+        let mut vals = vec![0.0f64; n];
+        let mut qual = vec![0i32; n];
+        let mut nr: i32 = 0;
+        let mut jb: i32 = 0;
+        let mut gr: i32 = 0;
+        let mut ubuf = [0i8; 64];
+        let mut tbuf = [0i8; 64];
+        let mut zbuf = [0i8; 64];
+
+        let status = hec_dss_tsRetrieve(
+            dss, pathname.as_ptr(),
+            sd.as_ptr(), st.as_ptr(), ed.as_ptr(), et.as_ptr(),
+            times.as_mut_ptr(), vals.as_mut_ptr(), nv,
+            &mut nr, qual.as_mut_ptr(), qs,
+            &mut jb, &mut gr,
+            ubuf.as_mut_ptr() as *mut std::os::raw::c_char, 64,
+            tbuf.as_mut_ptr() as *mut std::os::raw::c_char, 64,
+            zbuf.as_mut_ptr() as *mut std::os::raw::c_char, 64,
+        );
+        assert_eq!(status, 0, "C tsRetrieve failed");
+        assert!(nr >= 5, "C should read at least 5 values, got {nr}");
+
+        // Verify values
+        println!("C read {} values from Rust-written TS", nr);
+        println!("First 5: {:?}", &vals[..5]);
+        assert!((vals[0] - 10.0).abs() < 0.001);
+        assert!((vals[1] - 20.0).abs() < 0.001);
+        assert!((vals[2] - 30.0).abs() < 0.001);
+        assert!((vals[3] - 40.0).abs() < 0.001);
+        assert!((vals[4] - 50.0).abs() < 0.001);
+
+        // Verify units
+        let units_str = std::ffi::CStr::from_ptr(ubuf.as_ptr() as *const std::os::raw::c_char)
+            .to_str().unwrap_or("");
+        println!("Units from C: '{units_str}'");
+
+        hec_dss_close(dss);
+    }
+
+    // Also verify Rust can read it back
+    {
+        let mut dss = NativeDssFile::open(path.to_str().unwrap()).unwrap();
+        let ts = dss.read_ts("/RUST/WROTE/FLOW/01JAN2020/1HOUR/NATIVE/").unwrap().unwrap();
+        assert!(ts.values.len() >= 5);
+        assert!((ts.values[0] - 10.0).abs() < 0.001);
+    }
+
+    println!("Pure Rust TS write -> C read = SUCCESS");
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Write paired data via C, then read via pure Rust NativeDssFile.
 #[test]
 fn test_c_writes_pd_rust_reads() {
