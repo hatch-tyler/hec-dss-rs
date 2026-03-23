@@ -279,6 +279,41 @@ impl DssFile {
         self.get_mut()?.check_file().map_err(io_err)
     }
 
+    // --- Aliases ---
+
+    /// Add an alias that points to a primary record.
+    fn alias_add(&mut self, primary_pathname: &str, alias_pathname: &str) -> PyResult<()> {
+        self.get_mut()?.alias_add(primary_pathname, alias_pathname).map_err(io_err)
+    }
+
+    /// Remove an alias.
+    fn alias_remove(&mut self, alias_pathname: &str) -> PyResult<()> {
+        self.get_mut()?.alias_remove(alias_pathname).map_err(io_err)
+    }
+
+    /// List all aliases. Returns list of (alias_pathname, info_address) tuples.
+    fn alias_list(&mut self) -> PyResult<Vec<(String, i64)>> {
+        self.get_mut()?.alias_list().map_err(io_err)
+    }
+
+    // --- CRC / What-Changed ---
+
+    /// Compute CRC32 for a record's data. Returns 0 if not found.
+    fn get_data_crc(&mut self, pathname: &str) -> PyResult<u32> {
+        self.get_mut()?.get_data_crc(pathname).map_err(io_err)
+    }
+
+    /// Take a CRC snapshot of all records. Returns list of (pathname, crc) tuples.
+    fn snapshot_crcs(&mut self) -> PyResult<Vec<(String, u32)>> {
+        self.get_mut()?.snapshot_crcs().map_err(io_err)
+    }
+
+    /// Compare two CRC snapshots. Returns (changed, added, removed) pathname lists.
+    #[staticmethod]
+    fn what_changed(before: Vec<(String, u32)>, after: Vec<(String, u32)>) -> (Vec<String>, Vec<String>, Vec<String>) {
+        NativeDssFile::what_changed(&before, &after)
+    }
+
     // --- Date utilities (static methods) ---
 
     /// Convert a date string to DSS Julian date.

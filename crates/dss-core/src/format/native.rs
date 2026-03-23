@@ -121,6 +121,22 @@ fn validate_pathname(pathname: &str) -> io::Result<()> {
     Ok(())
 }
 
+/// Simple CRC32 implementation (IEEE 802.3 polynomial).
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= byte as u32;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0xEDB8_8320;
+            } else {
+                crc >>= 1;
+            }
+        }
+    }
+    !crc
+}
+
 fn current_time_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -687,6 +703,169 @@ impl NativeDssFile {
         }
 
         Ok(issues)
+    }
+
+    // -----------------------------------------------------------------------
+    // Aliases
+    // -----------------------------------------------------------------------
+
+    /// Add an alias pathname that points to an existing primary record.
+    ///
+    /// The alias is stored as a separate bin entry with status=ALIAS that
+    /// references the same info block as the primary record.
+    pub fn alias_add(&mut self, primary_pathname: &str, alias_pathname: &str) -> io::Result<()> {
+        validate_pathname(alias_pathname)?;
+
+        // Find the primary record's info address
+        let primary_entry = match self.find_record(primary_pathname)? {
+            Some(e) => e,
+            None => return Err(io::Error::new(io::ErrorKind::NotFound, "Primary record not found")),
+        };
+
+        let alias_path_bytes = alias_pathname.as_bytes();
+        let ph = hash::pathname_hash(alias_path_bytes);
+        let th = hash::table_hash(alias_path_bytes, self.max_hash());
+        let now = current_time_millis();
+
+        // Write a bin entry for the alias pointing to the primary's info block
+        let path_longs = num_longs_in_bytes(alias_path_bytes.len());
+        let entry_words = bk::FIXED_SIZE + path_longs;
+        let bs = self.bin_size() as i64;
+
+        if self.header[fh::BINS_REMAIN_IN_BLOCK] <= 0 {
+            self.allocate_new_bin_block()?;
+        }
+        let next = self.header[fh::ADD_NEXT_EMPTY_BIN];
+
+        let mut entry = vec![0i64; entry_words];
+        entry[bk::HASH] = ph;
+        entry[bk::STATUS] = keys::record_status::ALIAS; // Status = 2 (ALIAS)
+        entry[bk::PATH_LEN] = dss_io::pack_i4(alias_path_bytes.len() as i32, path_longs as i32);
+        entry[bk::INFO_ADD] = primary_entry.info_address; // Points to primary's info
+        entry[bk::TYPE_AND_CAT_SORT] = dss_io::pack_i4(primary_entry.data_type, 0);
+        entry[bk::LAST_WRITE] = now;
+        let pw = bytes_to_words(alias_path_bytes);
+        entry[bk::PATH..bk::PATH + pw.len()].copy_from_slice(&pw);
+
+        write_words(&mut self.file, next, &entry)?;
+
+        // Update hash table
+        let hts = self.hash_table_start();
+        let slot = hts + th as i64;
+        if dss_io::read_word(&mut self.file, slot)? == 0 {
+            write_words(&mut self.file, slot, &[next])?;
+            self.header[fh::HASHS_USED] += 1;
+        }
+
+        self.header[fh::ADD_NEXT_EMPTY_BIN] = next + bs;
+        self.header[fh::TOTAL_BINS] += 1;
+        self.header[fh::BINS_REMAIN_IN_BLOCK] -= 1;
+        self.header[fh::NUMBER_ALIASES] += 1;
+        self.header[fh::LAST_WRITE_TIME] = now;
+        write_words(&mut self.file, 0, &self.header)?;
+        self.file.flush()
+    }
+
+    /// Remove an alias by marking its bin entry as ALIAS_DELETED.
+    pub fn alias_remove(&mut self, alias_pathname: &str) -> io::Result<()> {
+        let mh = self.max_hash();
+        let ph = hash::pathname_hash(alias_pathname.as_bytes());
+        let th = hash::table_hash(alias_pathname.as_bytes(), mh);
+        let hts = self.hash_table_start();
+        let bin_addr = dss_io::read_word(&mut self.file, hts + th as i64)?;
+        if bin_addr <= 0 {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Alias not found"));
+        }
+
+        let bs = self.bin_size() as usize;
+        let block = dss_io::read_words(&mut self.file, bin_addr, bs)?;
+        let mut pos = 0;
+        while pos + bk::FIXED_SIZE <= bs {
+            let h = block[pos + bk::HASH];
+            if h == 0 { break; }
+            let (_, pw) = dss_io::unpack_i4(block[pos + bk::PATH_LEN]);
+            if h == ph && block[pos + bk::STATUS] == keys::record_status::ALIAS {
+                let status_addr = bin_addr + (pos + bk::STATUS) as i64;
+                write_words(&mut self.file, status_addr, &[keys::record_status::ALIAS_DELETED])?;
+                self.header[fh::NUMBER_ALIAS_DELETES] += 1;
+                write_words(&mut self.file, 0, &self.header)?;
+                self.file.flush()?;
+                return Ok(());
+            }
+            pos += bk::FIXED_SIZE + pw as usize;
+        }
+        Err(io::Error::new(io::ErrorKind::NotFound, "Alias not found in bin"))
+    }
+
+    /// List all aliases in the file. Returns (alias_pathname, primary_info_address) pairs.
+    pub fn alias_list(&mut self) -> io::Result<Vec<(String, i64)>> {
+        let (fb, bs, bpb) = (self.first_bin_addr(), self.bin_size(), self.bins_per_block());
+        let entries = bin::read_all_bins(&mut self.file, fb, bs, bpb)?;
+        Ok(entries.iter()
+            .filter(|e| e.status == keys::record_status::ALIAS)
+            .map(|e| (e.pathname.clone(), e.info_address))
+            .collect())
+    }
+
+    // -----------------------------------------------------------------------
+    // CRC / What-Changed
+    // -----------------------------------------------------------------------
+
+    /// Compute a CRC32 for a record's data (values1 area).
+    ///
+    /// Returns 0 if the record is not found.
+    pub fn get_data_crc(&mut self, pathname: &str) -> io::Result<u32> {
+        let info = match self.read_record_info(pathname)? {
+            Some(i) => i,
+            None => return Ok(0),
+        };
+        let addr = info.values1_address();
+        let num = info.values1_number();
+        if num <= 0 || addr <= 0 {
+            return Ok(0);
+        }
+        let data = RecordInfo::read_data_area(&mut self.file, addr, num)?;
+        Ok(crc32(&data))
+    }
+
+    /// Take a snapshot of CRC values for all records (for change detection).
+    pub fn snapshot_crcs(&mut self) -> io::Result<Vec<(String, u32)>> {
+        let entries = self.catalog()?;
+        let mut crcs = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let crc = self.get_data_crc(&entry.pathname)?;
+            crcs.push((entry.pathname.clone(), crc));
+        }
+        Ok(crcs)
+    }
+
+    /// Compare two CRC snapshots and return changed/added/removed pathnames.
+    pub fn what_changed(
+        before: &[(String, u32)],
+        after: &[(String, u32)],
+    ) -> (Vec<String>, Vec<String>, Vec<String>) {
+        use std::collections::HashMap;
+        let before_map: HashMap<&str, u32> = before.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+        let after_map: HashMap<&str, u32> = after.iter().map(|(p, c)| (p.as_str(), *c)).collect();
+
+        let mut changed = Vec::new();
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+
+        for (path, crc) in &after_map {
+            match before_map.get(path) {
+                Some(old_crc) if old_crc != crc => changed.push(path.to_string()),
+                None => added.push(path.to_string()),
+                _ => {}
+            }
+        }
+        for path in before_map.keys() {
+            if !after_map.contains_key(path) {
+                removed.push(path.to_string());
+            }
+        }
+
+        (changed, added, removed)
     }
 
     /// Read the record info for a pathname. Returns None if not found.
@@ -2328,6 +2507,67 @@ mod tests {
         ).unwrap();
         assert_eq!(d.record_count(), 1);
         assert_eq!(d.record_type("/A/B/STAGE//IR-MONTH/OBS/").unwrap(), 115); // ITD
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_alias_add_and_list() {
+        let p = temp_path("alias");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        d.write_text("/A/B/NOTE///PRIMARY/", "original").unwrap();
+        d.alias_add("/A/B/NOTE///PRIMARY/", "/ALIAS/PATH/NOTE///ALT/").unwrap();
+
+        let aliases = d.alias_list().unwrap();
+        assert_eq!(aliases.len(), 1);
+        assert!(aliases[0].0.contains("ALIAS"));
+
+        // Catalog should include both primary and alias
+        let cat = d.catalog().unwrap();
+        assert!(cat.len() >= 2);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_alias_remove() {
+        let p = temp_path("alias_rm");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        d.write_text("/A/B/NOTE///PRI/", "data").unwrap();
+        d.alias_add("/A/B/NOTE///PRI/", "/ALIAS/RM/NOTE///ALT/").unwrap();
+        assert_eq!(d.alias_list().unwrap().len(), 1);
+
+        d.alias_remove("/ALIAS/RM/NOTE///ALT/").unwrap();
+        assert_eq!(d.alias_list().unwrap().len(), 0);
+
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_crc_and_what_changed() {
+        let p = temp_path("crc");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        d.write_text("/A/B/NOTE///CRC/", "hello").unwrap();
+
+        let crc = d.get_data_crc("/A/B/NOTE///CRC/").unwrap();
+        assert_ne!(crc, 0);
+
+        // Same data = same CRC
+        let crc2 = d.get_data_crc("/A/B/NOTE///CRC/").unwrap();
+        assert_eq!(crc, crc2);
+
+        // Snapshot before
+        let before = d.snapshot_crcs().unwrap();
+        d.write_text("/A/B/NOTE///NEW/", "new record").unwrap();
+        let after = d.snapshot_crcs().unwrap();
+
+        let (changed, added, removed) = NativeDssFile::what_changed(&before, &after);
+        assert!(added.iter().any(|p| p.contains("NEW")));
+        assert!(changed.is_empty());
+        assert!(removed.is_empty());
+
         let _ = std::fs::remove_file(&p);
     }
 
