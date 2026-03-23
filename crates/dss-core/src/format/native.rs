@@ -188,6 +188,18 @@ pub struct ArrayRecord {
     pub double_values: Vec<f64>,
 }
 
+/// Grid/spatial data read from a DSS7 file.
+#[derive(Debug, Clone, Default)]
+pub struct GridRecord {
+    pub grid_type: i32,
+    pub nx: i32,
+    pub ny: i32,
+    pub cell_size: f32,
+    pub data_units: String,
+    pub data: Vec<f32>,
+    pub record_type: i32,
+}
+
 /// Location data read from a DSS7 file.
 #[derive(Debug, Clone, Default)]
 pub struct LocationRecord {
@@ -1241,6 +1253,362 @@ impl NativeDssFile {
             vertical_datum: v_datum,
             timezone: tz,
             supplemental,
+        }))
+    }
+
+    /// Write location data for a pathname.
+    pub fn write_location(
+        &mut self,
+        pathname: &str,
+        loc: &LocationRecord,
+    ) -> io::Result<()> {
+        validate_pathname(pathname)?;
+        let path_bytes = pathname.as_bytes();
+
+        // Build values1: 6 floats for coords + 6 ints for datum + timezone chars
+        let mut v1_i32s: Vec<i32> = Vec::with_capacity(20);
+        // Pack x, y, z as float pairs (each double -> 2 floats, but DSS uses single float per coord)
+        v1_i32s.push(i32::from_le_bytes((loc.x as f32).to_le_bytes()));
+        v1_i32s.push(0); // padding for double alignment
+        v1_i32s.push(i32::from_le_bytes((loc.y as f32).to_le_bytes()));
+        v1_i32s.push(0);
+        v1_i32s.push(i32::from_le_bytes((loc.z as f32).to_le_bytes()));
+        v1_i32s.push(0);
+        v1_i32s.push(loc.coordinate_system);
+        v1_i32s.push(loc.coordinate_id);
+        v1_i32s.push(loc.horizontal_units);
+        v1_i32s.push(loc.horizontal_datum);
+        v1_i32s.push(loc.vertical_units);
+        v1_i32s.push(loc.vertical_datum);
+
+        // Timezone string packed as i32 words
+        if !loc.timezone.is_empty() {
+            let tz_bytes = loc.timezone.as_bytes();
+            for chunk in tz_bytes.chunks(4) {
+                let mut b = [0u8; 4];
+                b[..chunk.len()].copy_from_slice(chunk);
+                v1_i32s.push(i32::from_le_bytes(b));
+            }
+        }
+
+        let v1_ints = v1_i32s.len();
+        let v1_longs = num_longs_in_ints(v1_ints);
+
+        // User header for supplemental
+        let uh_bytes = loc.supplemental.as_bytes();
+        let uh_ints = num_ints_in_bytes(uh_bytes.len());
+        let uh_longs = num_longs_in_ints(uh_ints);
+
+        let path_longs = num_longs_in_bytes(path_bytes.len());
+        let info_size = ri::PATHNAME + path_longs;
+        let total = info_size + v1_longs + uh_longs;
+
+        let base = self.file_size();
+        let info_addr = base;
+        let v1_addr = base + info_size as i64;
+        let uh_addr = v1_addr + v1_longs as i64;
+        let new_eof = base + total as i64;
+
+        let ph = hash::pathname_hash(path_bytes);
+        let th = hash::table_hash(path_bytes, self.max_hash());
+        let now = current_time_millis();
+
+        let mut info = vec![0i64; info_size];
+        info[ri::FLAG] = keys::DSS_INFO_FLAG;
+        info[ri::STATUS] = keys::record_status::PRIMARY;
+        info[ri::PATHNAME_LENGTH] = path_bytes.len() as i64;
+        info[ri::HASH] = ph;
+        info[ri::TYPE_VERSION] = dss_io::pack_i4(20, 1); // DATA_TYPE_LOCATION
+        info[ri::LAST_WRITE_TIME] = now;
+        info[ri::CREATION_TIME] = now;
+        info[ri::VALUES1_ADDRESS] = v1_addr;
+        info[ri::VALUES1_NUMBER] = v1_ints as i64;
+        if uh_ints > 0 {
+            info[ri::USER_HEAD_ADDRESS] = uh_addr;
+            info[ri::USER_HEAD_NUMBER] = uh_ints as i64;
+        }
+        info[ri::ALLOCATED_SIZE] = (total * 2) as i64;
+        let pw = bytes_to_words(path_bytes);
+        info[ri::PATHNAME..ri::PATHNAME + pw.len()].copy_from_slice(&pw);
+        write_words(&mut self.file, info_addr, &info)?;
+
+        // Pack v1_i32s into i64 words
+        let v1_words: Vec<i64> = v1_i32s.chunks(2).map(|c| {
+            dss_io::pack_i4(c[0], if c.len() > 1 { c[1] } else { 0 })
+        }).collect();
+        let mut v1_padded = v1_words;
+        v1_padded.resize(v1_longs, 0);
+        write_words(&mut self.file, v1_addr, &v1_padded)?;
+
+        // User header (supplemental)
+        if !uh_bytes.is_empty() {
+            let mut uh = bytes_to_words(uh_bytes);
+            uh.resize(uh_longs, 0);
+            write_words(&mut self.file, uh_addr, &uh)?;
+        }
+
+        write_words(&mut self.file, new_eof, &[keys::DSS_END_FILE_FLAG])?;
+        self.write_bin_entry(pathname, ph, th, info_addr, 20, now)?;
+        self.header[fh::NUMBER_RECORDS] += 1;
+        self.header[fh::FILE_SIZE] = new_eof;
+        self.header[fh::LAST_WRITE_TIME] = now;
+        write_words(&mut self.file, 0, &self.header)?;
+        self.file.flush()
+    }
+
+    // -----------------------------------------------------------------------
+    // Irregular time series write
+    // -----------------------------------------------------------------------
+
+    /// Write an irregular time series record (double precision).
+    ///
+    /// Times are offsets from base date in units of `time_granularity_seconds`.
+    pub fn write_ts_irregular(
+        &mut self,
+        pathname: &str,
+        times: &[i32],
+        values: &[f64],
+        time_granularity_seconds: i32,
+        units: &str,
+        data_type_str: &str,
+    ) -> io::Result<()> {
+        validate_pathname(pathname)?;
+        if values.is_empty() || times.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Values or times array is empty"));
+        }
+        if times.len() != values.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Times and values must have same length"));
+        }
+
+        let path_bytes = pathname.as_bytes();
+        let n = values.len();
+
+        // Internal header (same structure as regular TS)
+        let mut char_data = Vec::new();
+        char_data.extend_from_slice(units.as_bytes());
+        char_data.push(0);
+        char_data.extend_from_slice(data_type_str.as_bytes());
+        char_data.push(0);
+
+        let char_ints = num_ints_in_bytes(char_data.len());
+        let ih_ints = tsh::UNITS + 1 + char_ints;
+        let ih_longs = num_longs_in_ints(ih_ints);
+
+        let mut ih_i32 = vec![0i32; ih_ints];
+        ih_i32[tsh::TIME_GRANULARITY] = time_granularity_seconds;
+        ih_i32[tsh::VALUE_SIZE] = 2;
+        ih_i32[tsh::VALUE_ELEMENT_SIZE] = 2;
+        ih_i32[tsh::BLOCK_END_POSITION] = (n as i32).saturating_sub(1).max(0);
+        ih_i32[tsh::VALUES_NUMBER] = n as i32;
+        ih_i32[tsh::UNITS] = 0x20202020u32 as i32;
+        for (i, chunk) in char_data.chunks(4).enumerate() {
+            let mut b = [0u8; 4];
+            b[..chunk.len()].copy_from_slice(chunk);
+            if tsh::UNITS + 1 + i < ih_i32.len() {
+                ih_i32[tsh::UNITS + 1 + i] = i32::from_le_bytes(b);
+            }
+        }
+
+        let mut ih_words = vec![0i64; ih_longs];
+        for (i, chunk) in ih_i32.chunks(2).enumerate() {
+            ih_words[i] = dss_io::pack_i4(chunk[0], if chunk.len() > 1 { chunk[1] } else { 0 });
+        }
+
+        // values1 = data values (doubles), values2 = times (i32s)
+        let v1_ints = n * 2;
+        let v1_longs = n;
+        let v1_words: Vec<i64> = values.iter().map(|&v| i64::from_le_bytes(v.to_le_bytes())).collect();
+
+        let v2_ints = n;
+        let v2_longs = num_longs_in_ints(v2_ints);
+        let v2_words: Vec<i64> = times.chunks(2).map(|c| {
+            dss_io::pack_i4(c[0], if c.len() > 1 { c[1] } else { 0 })
+        }).collect();
+
+        let path_longs = num_longs_in_bytes(path_bytes.len());
+        let info_size = ri::PATHNAME + path_longs;
+        let total = info_size + ih_longs + v1_longs + v2_longs;
+
+        let base = self.file_size();
+        let info_addr = base;
+        let ih_addr = base + info_size as i64;
+        let v1_addr = ih_addr + ih_longs as i64;
+        let v2_addr = v1_addr + v1_longs as i64;
+        let new_eof = base + total as i64;
+
+        let ph = hash::pathname_hash(path_bytes);
+        let th = hash::table_hash(path_bytes, self.max_hash());
+        let now = current_time_millis();
+
+        let mut info = vec![0i64; info_size];
+        info[ri::FLAG] = keys::DSS_INFO_FLAG;
+        info[ri::STATUS] = keys::record_status::PRIMARY;
+        info[ri::PATHNAME_LENGTH] = path_bytes.len() as i64;
+        info[ri::HASH] = ph;
+        info[ri::TYPE_VERSION] = dss_io::pack_i4(dt::ITD, 1); // Irregular TS doubles
+        info[ri::LAST_WRITE_TIME] = now;
+        info[ri::CREATION_TIME] = now;
+        info[ri::INTERNAL_HEAD_ADDRESS] = ih_addr;
+        info[ri::INTERNAL_HEAD_NUMBER] = ih_ints as i64;
+        info[ri::VALUES1_ADDRESS] = v1_addr;
+        info[ri::VALUES1_NUMBER] = v1_ints as i64;
+        info[ri::VALUES2_ADDRESS] = v2_addr;
+        info[ri::VALUES2_NUMBER] = v2_ints as i64;
+        info[ri::ALLOCATED_SIZE] = (total * 2) as i64;
+        info[ri::NUMBER_DATA] = n as i64;
+        info[ri::LOGICAL_NUMBER] = n as i64;
+        let pw = bytes_to_words(path_bytes);
+        info[ri::PATHNAME..ri::PATHNAME + pw.len()].copy_from_slice(&pw);
+        write_words(&mut self.file, info_addr, &info)?;
+
+        write_words(&mut self.file, ih_addr, &ih_words)?;
+        write_words(&mut self.file, v1_addr, &v1_words)?;
+        let mut v2_padded = v2_words;
+        v2_padded.resize(v2_longs, 0);
+        write_words(&mut self.file, v2_addr, &v2_padded)?;
+
+        write_words(&mut self.file, new_eof, &[keys::DSS_END_FILE_FLAG])?;
+        self.write_bin_entry(pathname, ph, th, info_addr, dt::ITD, now)?;
+        self.header[fh::NUMBER_RECORDS] += 1;
+        self.header[fh::FILE_SIZE] = new_eof;
+        self.header[fh::LAST_WRITE_TIME] = now;
+        write_words(&mut self.file, 0, &self.header)?;
+        self.file.flush()
+    }
+
+    // -----------------------------------------------------------------------
+    // Grid records (simplified - metadata + flat float array)
+    // -----------------------------------------------------------------------
+
+    /// Write a grid record. Data is a flat float array (ny * nx).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_grid(
+        &mut self,
+        pathname: &str,
+        grid_type: i32,
+        nx: i32, ny: i32,
+        data: &[f32],
+        data_units: &str,
+        cell_size: f32,
+    ) -> io::Result<()> {
+        validate_pathname(pathname)?;
+        if data.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Grid data is empty"));
+        }
+        let path_bytes = pathname.as_bytes();
+
+        // Internal header for grid: store basic grid metadata
+        // [gridType, dataType, llx, lly, nx, ny, nRanges, srsDef, tzOffset, isInterval, isTimeStamped, ...]
+        let mut ih_i32 = [0i32; 20];
+        ih_i32[0] = grid_type;
+        ih_i32[1] = 0; // dataType sub
+        ih_i32[2] = 0; // lowerLeftX
+        ih_i32[3] = 0; // lowerLeftY
+        ih_i32[4] = nx;
+        ih_i32[5] = ny;
+        ih_i32[6] = f32::to_bits(cell_size) as i32;
+        // Pack units string
+        for (i, chunk) in data_units.as_bytes().chunks(4).enumerate() {
+            let mut b = [0u8; 4];
+            b[..chunk.len()].copy_from_slice(chunk);
+            if 10 + i < ih_i32.len() {
+                ih_i32[10 + i] = i32::from_le_bytes(b);
+            }
+        }
+
+        let ih_ints = ih_i32.len();
+        let ih_longs = num_longs_in_ints(ih_ints);
+        let mut ih_words = vec![0i64; ih_longs];
+        for (i, chunk) in ih_i32.chunks(2).enumerate() {
+            ih_words[i] = dss_io::pack_i4(chunk[0], if chunk.len() > 1 { chunk[1] } else { 0 });
+        }
+
+        // Data as values1 (floats packed into i32 words)
+        let v1_ints = data.len();
+        let v1_longs = num_longs_in_ints(v1_ints);
+        let v1_words: Vec<i64> = data.chunks(2).map(|c| {
+            let mut bytes = [0u8; 8];
+            bytes[0..4].copy_from_slice(&c[0].to_le_bytes());
+            if c.len() > 1 { bytes[4..8].copy_from_slice(&c[1].to_le_bytes()); }
+            i64::from_le_bytes(bytes)
+        }).collect();
+
+        let path_longs = num_longs_in_bytes(path_bytes.len());
+        let info_size = ri::PATHNAME + path_longs;
+        let total = info_size + ih_longs + v1_longs;
+
+        let base = self.file_size();
+        let info_addr = base;
+        let ih_addr = base + info_size as i64;
+        let v1_addr = ih_addr + ih_longs as i64;
+        let new_eof = base + total as i64;
+
+        let ph = hash::pathname_hash(path_bytes);
+        let th = hash::table_hash(path_bytes, self.max_hash());
+        let now = current_time_millis();
+
+        let mut info = vec![0i64; info_size];
+        info[ri::FLAG] = keys::DSS_INFO_FLAG;
+        info[ri::STATUS] = keys::record_status::PRIMARY;
+        info[ri::PATHNAME_LENGTH] = path_bytes.len() as i64;
+        info[ri::HASH] = ph;
+        info[ri::TYPE_VERSION] = dss_io::pack_i4(grid_type, 1);
+        info[ri::LAST_WRITE_TIME] = now;
+        info[ri::CREATION_TIME] = now;
+        info[ri::INTERNAL_HEAD_ADDRESS] = ih_addr;
+        info[ri::INTERNAL_HEAD_NUMBER] = ih_ints as i64;
+        info[ri::VALUES1_ADDRESS] = v1_addr;
+        info[ri::VALUES1_NUMBER] = v1_ints as i64;
+        info[ri::ALLOCATED_SIZE] = (total * 2) as i64;
+        info[ri::NUMBER_DATA] = data.len() as i64;
+        info[ri::LOGICAL_NUMBER] = data.len() as i64;
+        let pw = bytes_to_words(path_bytes);
+        info[ri::PATHNAME..ri::PATHNAME + pw.len()].copy_from_slice(&pw);
+        write_words(&mut self.file, info_addr, &info)?;
+
+        write_words(&mut self.file, ih_addr, &ih_words)?;
+        let mut v1_padded = v1_words;
+        v1_padded.resize(v1_longs, 0);
+        write_words(&mut self.file, v1_addr, &v1_padded)?;
+
+        write_words(&mut self.file, new_eof, &[keys::DSS_END_FILE_FLAG])?;
+        self.write_bin_entry(pathname, ph, th, info_addr, grid_type, now)?;
+        self.header[fh::NUMBER_RECORDS] += 1;
+        self.header[fh::FILE_SIZE] = new_eof;
+        self.header[fh::LAST_WRITE_TIME] = now;
+        write_words(&mut self.file, 0, &self.header)?;
+        self.file.flush()
+    }
+
+    /// Read a grid record. Returns grid metadata and flat float data array.
+    pub fn read_grid(&mut self, pathname: &str) -> io::Result<Option<GridRecord>> {
+        let info = match self.read_record_info(pathname)? {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
+        let ih = self.read_internal_header(&info)?;
+        let grid_type = ih.first().copied().unwrap_or(0);
+        let nx = ih.get(4).copied().unwrap_or(0);
+        let ny = ih.get(5).copied().unwrap_or(0);
+        let cell_size = ih.get(6).map(|&v| f32::from_bits(v as u32)).unwrap_or(0.0);
+
+        // Units from internal header
+        let units = if ih.len() > 10 {
+            extract_string_from_i32s(&ih[10..])
+        } else { String::new() };
+
+        // Data from values1
+        let data = if info.values1_number() > 0 {
+            let raw = RecordInfo::read_data_area(&mut self.file, info.values1_address(), info.values1_number())?;
+            raw.chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect()
+        } else { Vec::new() };
+
+        Ok(Some(GridRecord {
+            grid_type, nx, ny, cell_size,
+            data_units: units,
+            data,
+            record_type: info.data_type(),
         }))
     }
 

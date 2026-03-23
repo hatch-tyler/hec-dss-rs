@@ -26,5 +26,5 @@ pub use format::hash;
 pub use format::keys;
 pub use format::pathname::Pathname;
 pub use format::header::FileHeader;
-pub use format::native::{NativeDssFile, TimeSeriesRecord, PairedDataRecord, LocationRecord, ArrayRecord};
+pub use format::native::{NativeDssFile, TimeSeriesRecord, PairedDataRecord, LocationRecord, ArrayRecord, GridRecord};
 pub use format::datetime;

@@ -619,6 +619,187 @@ pub unsafe extern "C" fn hec_dss_arrayRetrieve(
 }
 
 // ---------------------------------------------------------------------------
+// Location
+// ---------------------------------------------------------------------------
+
+/// Retrieve location data. Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_locationRetrieve(
+    dss: *mut DssFileHandle, full_path: *const c_char,
+    x: *mut c_double, y: *mut c_double, z: *mut c_double,
+    coordinate_system: *mut c_int, coordinate_id: *mut c_int,
+    horizontal_units: *mut c_int, horizontal_datum: *mut c_int,
+    vertical_units: *mut c_int, vertical_datum: *mut c_int,
+    time_zone_name: *mut c_char, time_zone_name_length: c_int,
+    supplemental: *mut c_char, supplemental_length: c_int,
+) -> c_int {
+    if dss.is_null() || full_path.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    match file.read_location(cstr_to_str(full_path)) {
+        Ok(Some(loc)) => {
+            if !x.is_null() { *x = loc.x; }
+            if !y.is_null() { *y = loc.y; }
+            if !z.is_null() { *z = loc.z; }
+            if !coordinate_system.is_null() { *coordinate_system = loc.coordinate_system; }
+            if !coordinate_id.is_null() { *coordinate_id = loc.coordinate_id; }
+            if !horizontal_units.is_null() { *horizontal_units = loc.horizontal_units; }
+            if !horizontal_datum.is_null() { *horizontal_datum = loc.horizontal_datum; }
+            if !vertical_units.is_null() { *vertical_units = loc.vertical_units; }
+            if !vertical_datum.is_null() { *vertical_datum = loc.vertical_datum; }
+            if !time_zone_name.is_null() { copy_to_c_buf(&loc.timezone, time_zone_name, time_zone_name_length); }
+            if !supplemental.is_null() { copy_to_c_buf(&loc.supplemental, supplemental, supplemental_length); }
+            0
+        }
+        _ => -1,
+    }
+}
+
+/// Store location data. Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_locationStore(
+    dss: *mut DssFileHandle, full_path: *const c_char,
+    x: c_double, y: c_double, z: c_double,
+    coordinate_system: c_int, coordinate_id: c_int,
+    horizontal_units: c_int, horizontal_datum: c_int,
+    vertical_units: c_int, vertical_datum: c_int,
+    time_zone_name: *const c_char,
+    supplemental_info: *const c_char,
+    _replace: c_int,
+) -> c_int {
+    if dss.is_null() || full_path.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    let loc = dss_core::LocationRecord {
+        x, y, z,
+        coordinate_system, coordinate_id,
+        horizontal_units, horizontal_datum,
+        vertical_units, vertical_datum,
+        timezone: cstr_to_str(time_zone_name).to_string(),
+        supplemental: cstr_to_str(supplemental_info).to_string(),
+    };
+    match file.write_location(cstr_to_str(full_path), &loc) {
+        Ok(()) => 0, Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Irregular Time Series
+// ---------------------------------------------------------------------------
+
+/// Store irregular-interval time series. Returns 0 on success.
+#[no_mangle]
+pub unsafe extern "C" fn hec_dss_tsStoreIregular(
+    dss: *mut DssFileHandle, pathname: *const c_char,
+    _start_date_base: *const c_char,
+    times: *mut c_int, time_granularity_seconds: c_int,
+    value_array: *mut c_double, value_array_size: c_int,
+    _quality_array: *mut c_int, _quality_array_size: c_int,
+    _save_as_float: c_int,
+    units: *const c_char, data_type: *const c_char,
+    _time_zone_name: *const c_char, _storage_flag: c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() || value_array.is_null()
+       || times.is_null() || value_array_size <= 0 {
+        return -1;
+    }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    let pn = cstr_to_str(pathname);
+    let u = cstr_to_str(units);
+    let dt = cstr_to_str(data_type);
+    let vals = std::slice::from_raw_parts(value_array, value_array_size as usize);
+    let tms = std::slice::from_raw_parts(times, value_array_size as usize);
+    match file.write_ts_irregular(pn, tms, vals, time_granularity_seconds, u, dt) {
+        Ok(()) => 0, Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Grid / Spatial
+// ---------------------------------------------------------------------------
+
+/// Store grid data. Returns 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn hec_dss_gridStore(
+    dss: *mut DssFileHandle, pathname: *const c_char,
+    grid_type: c_int, _data_type: c_int,
+    _lower_left_cell_x: c_int, _lower_left_cell_y: c_int,
+    number_of_cells_x: c_int, number_of_cells_y: c_int,
+    _number_of_ranges: c_int, _srs_definition_type: c_int,
+    _time_zone_raw_offset: c_int, _is_interval: c_int,
+    _is_time_stamped: c_int, _compression_size: c_int,
+    data_units: *const c_char,
+    _data_source: *const c_char,
+    _srs_name: *const c_char, _srs_definition: *const c_char,
+    _time_zone_id: *const c_char,
+    cell_size: f32, _x_coord_zero: f32, _y_coord_zero: f32,
+    _null_value: f32, _max_value: f32, _min_value: f32, _mean_value: f32,
+    _range_limit_table: *mut f32,
+    _number_exceeding: *mut c_int,
+    data: *mut f32,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() || data.is_null() { return -1; }
+    let n = (number_of_cells_x * number_of_cells_y) as usize;
+    if n == 0 { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    let d = std::slice::from_raw_parts(data, n);
+    match file.write_grid(
+        cstr_to_str(pathname), grid_type,
+        number_of_cells_x, number_of_cells_y,
+        d, cstr_to_str(data_units), cell_size,
+    ) {
+        Ok(()) => 0, Err(_) => -1,
+    }
+}
+
+/// Retrieve grid data. Returns 0 on success.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub unsafe extern "C" fn hec_dss_gridRetrieve(
+    dss: *mut DssFileHandle, pathname: *const c_char,
+    _bool_retrieve_data: c_int,
+    grid_type: *mut c_int, _data_type_out: *mut c_int,
+    _lower_left_x: *mut c_int, _lower_left_y: *mut c_int,
+    number_of_cells_x: *mut c_int, number_of_cells_y: *mut c_int,
+    _number_of_ranges: *mut c_int, _srs_definition_type: *mut c_int,
+    _time_zone_raw_offset: *mut c_int, _is_interval: *mut c_int,
+    _is_time_stamped: *mut c_int,
+    data_units: *mut c_char, data_units_length: c_int,
+    _data_source: *mut c_char, _data_source_length: c_int,
+    _srs_name: *mut c_char, _srs_name_length: c_int,
+    _srs_definition: *mut c_char, _srs_definition_length: c_int,
+    _time_zone_id: *mut c_char, _time_zone_id_length: c_int,
+    cell_size: *mut f32, _x_coord_zero: *mut f32,
+    _y_coord_zero: *mut f32, _null_value: *mut f32,
+    _max_value: *mut f32, _min_value: *mut f32, _mean_value: *mut f32,
+    _range_limit_table: *mut f32, _range_tables_length: c_int,
+    _number_exceeding: *mut c_int,
+    data: *mut f32, data_length: c_int,
+) -> c_int {
+    if dss.is_null() || pathname.is_null() { return -1; }
+    let handle = &*dss;
+    let mut file = lock_or_fail!(handle);
+    match file.read_grid(cstr_to_str(pathname)) {
+        Ok(Some(grid)) => {
+            if !grid_type.is_null() { *grid_type = grid.grid_type; }
+            if !number_of_cells_x.is_null() { *number_of_cells_x = grid.nx; }
+            if !number_of_cells_y.is_null() { *number_of_cells_y = grid.ny; }
+            if !cell_size.is_null() { *cell_size = grid.cell_size; }
+            if !data_units.is_null() { copy_to_c_buf(&grid.data_units, data_units, data_units_length); }
+            if !data.is_null() && data_length > 0 {
+                let n = grid.data.len().min(data_length as usize);
+                ptr::copy_nonoverlapping(grid.data.as_ptr(), data, n);
+            }
+            0
+        }
+        _ => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Query functions
 // ---------------------------------------------------------------------------
 
