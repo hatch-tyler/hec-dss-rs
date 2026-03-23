@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    name: Build & Test (Windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      # Build the C library for cross-validation tests
+      - name: Checkout hec-dss C library
+        uses: actions/checkout@v4
+        with:
+          repository: HydrologicEngineeringCenter/hec-dss
+          path: hec-dss-c
+
+      - name: Build C hecdss library
+        run: |
+          cmake -S hec-dss-c -B hec-dss-c/build
+          cmake --build hec-dss-c/build --config Release --target hecdss
+
+      - name: Build workspace
+        run: cargo build --release
+        env:
+          HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
+
+      - name: Run tests
+        run: cargo test --release
+        env:
+          HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
+          PATH: ${{ github.workspace }}/hec-dss-c/build/heclib/hecdss/Release;${{ env.PATH }}
+
+      - name: Upload DLL artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dss_ffi-windows-x64
+          path: target/release/dss_ffi.dll
+
+  build-pure-rust:
+    name: Build Pure Rust (no C dependency)
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build dss-core and dss-ffi
+        run: cargo build -p dss-core -p dss-ffi --release
+
+      - name: Run dss-core unit tests (no cross-validation)
+        run: cargo test -p dss-core --lib
+
+  clippy:
+    name: Clippy
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Clippy (dss-core, dss-ffi)
+        run: cargo clippy -p dss-core -p dss-ffi -- -D warnings

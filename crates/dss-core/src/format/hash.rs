@@ -39,9 +39,7 @@ pub fn table_hash(pathname: &[u8], max_hash: i32) -> i32 {
     for &ch in pathname {
         path.push(sanitize_char(ch));
     }
-    for _ in 0..8 {
-        path.push(0u8);
-    }
+    path.extend_from_slice(&[0u8; 8]);
 
     let pathname_length = pathname.len();
 

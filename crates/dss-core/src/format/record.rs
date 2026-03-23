@@ -30,7 +30,7 @@ impl RecordInfo {
         // Get pathname length to read the rest
         let path_bytes = base[ri::PATHNAME_LENGTH] as i32;
         let path_words = if path_bytes > 0 {
-            ((path_bytes as usize) + 7) / 8
+            (path_bytes as usize).div_ceil(8)
         } else {
             0
         };
@@ -42,8 +42,8 @@ impl RecordInfo {
         // Extract pathname
         let pathname = if path_bytes > 0 {
             let mut path_buf = Vec::with_capacity(path_bytes as usize);
-            for w in ri::PATHNAME..total_words {
-                path_buf.extend_from_slice(&raw[w].to_le_bytes());
+            for word in &raw[ri::PATHNAME..total_words] {
+                path_buf.extend_from_slice(&word.to_le_bytes());
             }
             path_buf.truncate(path_bytes as usize);
             String::from_utf8_lossy(&path_buf)

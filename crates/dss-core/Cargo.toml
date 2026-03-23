@@ -9,3 +9,10 @@ license.workspace = true
 dss-sys = { path = "../dss-sys" }
 thiserror = "2"
 fs2 = "0.4"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "dss_bench"
+harness = false

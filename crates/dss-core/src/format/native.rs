@@ -437,7 +437,7 @@ impl NativeDssFile {
         //   [0] = numberOrdinates, [1] = numberCurves,
         //   [2] = boolIndependentIsXaxis, [3] = labelsLength, [4] = precision
         //   [5+] = units
-        let n_ord   = ih.get(0).copied().unwrap_or(0) as usize;
+        let n_ord   = ih.first().copied().unwrap_or(0) as usize;
         let n_curves = ih.get(1).copied().unwrap_or(0) as usize;
         let labels_len = ih.get(3).copied().unwrap_or(0) as usize;
         let is_double = rtype == dt::PDD;
@@ -560,7 +560,7 @@ impl NativeDssFile {
         }
 
         // Values as i64 words (doubles are already 8 bytes = 1 i64 word each)
-        let v1_ints = (n_values * 2) as usize; // doubles = 2 i32 words each
+        let v1_ints = n_values * 2; // doubles = 2 i32 words each
         let v1_longs = n_values; // each f64 = 1 i64 word
         let v1_words: Vec<i64> = values.iter().map(|&v| i64::from_le_bytes(v.to_le_bytes())).collect();
 
@@ -633,6 +633,7 @@ impl NativeDssFile {
     /// * `units_independent` - Units for ordinates
     /// * `units_dependent` - Units for values
     /// * `labels` - Optional curve labels (null-separated)
+    #[allow(clippy::too_many_arguments)]
     pub fn write_pd(
         &mut self,
         pathname: &str,
@@ -837,8 +838,7 @@ impl NativeDssFile {
         }
         let remain = self.header[fh::BINS_REMAIN_IN_BLOCK];
         if remain <= 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "Bin block full; overflow allocation not yet implemented",
             ));
         }

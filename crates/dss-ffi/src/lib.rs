@@ -8,6 +8,7 @@
 //! All operations are backed by `dss_core::NativeDssFile` (pure Rust).
 
 #![allow(private_interfaces)]
+#![allow(clippy::missing_safety_doc)] // All FFI functions are unsafe by definition
 
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_double, c_int};
@@ -200,10 +201,10 @@ pub unsafe extern "C" fn hec_dss_catalog(
     };
 
     let max = (count as usize).min(entries.len());
-    for i in 0..max {
+    for (i, entry) in entries.iter().enumerate().take(max) {
         let dst = path_buffer.add(i * path_buffer_item_size as usize);
-        copy_to_c_buf(&entries[i].pathname, dst, path_buffer_item_size);
-        *record_types.add(i) = entries[i].record_type;
+        copy_to_c_buf(&entry.pathname, dst, path_buffer_item_size);
+        *record_types.add(i) = entry.record_type;
     }
     max as c_int
 }

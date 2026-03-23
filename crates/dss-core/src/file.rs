@@ -134,6 +134,7 @@ impl DssFile {
         }
 
         let mut entries = Vec::new();
+        #[allow(clippy::needless_range_loop)]
         for i in 0..std::cmp::min(num_found as usize, n) {
             let offset = i * item_size;
             let slice = &path_buf[offset..offset + item_size];
