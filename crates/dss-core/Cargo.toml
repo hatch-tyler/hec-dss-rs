@@ -12,6 +12,7 @@ fs2 = "0.4"
 
 [dev-dependencies]
 criterion = "0.5"
+proptest = "1"
 
 [[bench]]
 name = "dss_bench"

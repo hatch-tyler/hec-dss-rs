@@ -815,7 +815,7 @@ impl NativeDssFile {
         Ok(String::from_utf8_lossy(&raw).trim_end_matches('\0').to_string())
     }
 
-    /// Write a bin entry for a new record into the current bin block.
+    /// Write a bin entry for a new record. Allocates new bin blocks on overflow.
     fn write_bin_entry(
         &mut self,
         pathname: &str,
@@ -828,20 +828,21 @@ impl NativeDssFile {
         let path_bytes = pathname.as_bytes();
         let path_longs = num_longs_in_bytes(path_bytes.len());
         let entry_words = bk::FIXED_SIZE + path_longs;
-        let bs = self.bin_size() as usize;
+        let bs = self.bin_size() as i64;
+        let bpb = self.bins_per_block() as i64;
 
-        if entry_words > bs {
+        if entry_words > bs as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Pathname too long for bin ({entry_words} > {bs} words)"),
             ));
         }
-        let remain = self.header[fh::BINS_REMAIN_IN_BLOCK];
-        if remain <= 0 {
-            return Err(io::Error::other(
-                "Bin block full; overflow allocation not yet implemented",
-            ));
+
+        // If current bin block is full, allocate a new one
+        if self.header[fh::BINS_REMAIN_IN_BLOCK] <= 0 {
+            self.allocate_new_bin_block()?;
         }
+
         let next = self.header[fh::ADD_NEXT_EMPTY_BIN];
         if next <= 0 {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid next_empty bin address"));
@@ -869,9 +870,43 @@ impl NativeDssFile {
             self.header[fh::HASHS_USED] += 1;
         }
 
-        self.header[fh::ADD_NEXT_EMPTY_BIN] = next + bs as i64;
+        self.header[fh::ADD_NEXT_EMPTY_BIN] = next + bs;
         self.header[fh::TOTAL_BINS] += 1;
-        self.header[fh::BINS_REMAIN_IN_BLOCK] = remain - 1;
+        self.header[fh::BINS_REMAIN_IN_BLOCK] -= 1;
+        Ok(())
+    }
+
+    /// Allocate a new bin block at EOF and chain it from the current block.
+    fn allocate_new_bin_block(&mut self) -> io::Result<()> {
+        let bs = self.bin_size() as i64;
+        let bpb = self.bins_per_block() as i64;
+        let block_size = bs * bpb + 1; // +1 for overflow pointer
+
+        // The overflow pointer is at the end of the current block.
+        // Current block start = first_bin + (block_index * block_size)
+        // We find the overflow word by: next_empty - bs (last used slot's end)
+        // actually the overflow pointer is at: block_start + bs * bpb
+        // Since bins_remain == 0, next_empty points to one past the last slot,
+        // which is exactly the overflow pointer position.
+        let overflow_ptr_addr = self.header[fh::ADD_NEXT_EMPTY_BIN];
+
+        // Allocate new block at EOF
+        let new_block_addr = self.file_size();
+        let new_file_size = new_block_addr + block_size;
+
+        // Write the new block (zeros)
+        let zeros = vec![0i64; block_size as usize];
+        write_words(&mut self.file, new_block_addr, &zeros)?;
+
+        // Write overflow pointer from old block to new block
+        write_words(&mut self.file, overflow_ptr_addr, &[new_block_addr])?;
+
+        // Update header
+        self.header[fh::ADD_NEXT_EMPTY_BIN] = new_block_addr;
+        self.header[fh::BINS_REMAIN_IN_BLOCK] = bpb;
+        self.header[fh::FILE_SIZE] = new_file_size;
+        self.header[fh::BINS_OVERFLOW] += 1;
+
         Ok(())
     }
 }
@@ -1014,6 +1049,32 @@ mod tests {
         let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
         d.write_text("/A/B/NOTE///E/", "").unwrap();
         assert_eq!(d.read_text("/A/B/NOTE///E/").unwrap(), Some(String::new()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_bin_overflow_many_records() {
+        // Default: 32 bins per block. Write 40 records to trigger overflow.
+        let p = temp_path("overflow");
+        let _ = std::fs::remove_file(&p);
+        {
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            for i in 0..40 {
+                d.write_text(
+                    &format!("/OVF/TEST/NOTE/{i}//REC/"),
+                    &format!("Record number {i}"),
+                ).unwrap();
+            }
+        }
+        {
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            assert_eq!(d.record_count(), 40);
+            let cat = d.catalog().unwrap();
+            assert!(cat.len() >= 39, "Expected at least 39 catalog entries, got {}", cat.len());
+            // Verify a record from each side of the overflow boundary
+            assert_eq!(d.read_text("/OVF/TEST/NOTE/0//REC/").unwrap(), Some("Record number 0".into()));
+            assert_eq!(d.read_text("/OVF/TEST/NOTE/39//REC/").unwrap(), Some("Record number 39".into()));
+        }
         let _ = std::fs::remove_file(&p);
     }
 }
