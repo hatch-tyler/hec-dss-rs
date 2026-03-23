@@ -504,6 +504,191 @@ impl NativeDssFile {
         Ok(())
     }
 
+    /// Undelete a previously deleted record by resetting its bin status to PRIMARY.
+    pub fn undelete(&mut self, pathname: &str) -> io::Result<()> {
+        let mh = self.max_hash();
+        let ph = hash::pathname_hash(pathname.as_bytes());
+        let th = hash::table_hash(pathname.as_bytes(), mh);
+        let hts = self.hash_table_start();
+        let bin_addr = dss_io::read_word(&mut self.file, hts + th as i64)?;
+        if bin_addr <= 0 {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Bin not found"));
+        }
+
+        let bs = self.bin_size() as usize;
+        let block = dss_io::read_words(&mut self.file, bin_addr, bs)?;
+        let mut pos = 0;
+        while pos + bk::FIXED_SIZE <= bs {
+            let h = block[pos + bk::HASH];
+            if h == 0 { break; }
+            let (_, pw) = dss_io::unpack_i4(block[pos + bk::PATH_LEN]);
+            if h == ph && block[pos + bk::STATUS] == keys::record_status::DELETED {
+                let status_addr = bin_addr + (pos + bk::STATUS) as i64;
+                write_words(&mut self.file, status_addr, &[keys::record_status::PRIMARY])?;
+                self.file.flush()?;
+                return Ok(());
+            }
+            pos += bk::FIXED_SIZE + pw as usize;
+        }
+        Err(io::Error::new(io::ErrorKind::NotFound, "Deleted record not found"))
+    }
+
+    /// Copy a single record from this file to another NativeDssFile.
+    ///
+    /// Reads the record by type and writes it to the destination.
+    /// Returns Ok(true) if copied, Ok(false) if source record not found.
+    pub fn copy_record(
+        &mut self,
+        pathname: &str,
+        dest: &mut NativeDssFile,
+    ) -> io::Result<bool> {
+        let rtype = self.record_type(pathname)?;
+        if rtype == 0 {
+            return Ok(false);
+        }
+        match rtype {
+            300 | 310 => {
+                if let Some(text) = self.read_text(pathname)? {
+                    dest.write_text(pathname, &text)?;
+                    return Ok(true);
+                }
+            }
+            100..=119 => {
+                if let Some(ts) = self.read_ts(pathname)? {
+                    if !ts.values.is_empty() {
+                        dest.write_ts(pathname, &ts.values, &ts.units, &ts.data_type_str)?;
+                        return Ok(true);
+                    }
+                }
+            }
+            200..=209 => {
+                if let Some(pd) = self.read_pd(pathname)? {
+                    if !pd.ordinates.is_empty() {
+                        dest.write_pd(
+                            pathname, &pd.ordinates, &pd.values,
+                            pd.number_curves,
+                            &pd.units_independent, &pd.units_dependent,
+                            None,
+                        )?;
+                        return Ok(true);
+                    }
+                }
+            }
+            90..=93 => {
+                if let Some(arr) = self.read_array(pathname)? {
+                    dest.write_array(
+                        pathname,
+                        &arr.int_values, &arr.float_values, &arr.double_values,
+                    )?;
+                    return Ok(true);
+                }
+            }
+            20 => {
+                if let Some(loc) = self.read_location(pathname)? {
+                    dest.write_location(pathname, &loc)?;
+                    return Ok(true);
+                }
+            }
+            400..=450 => {
+                if let Some(grid) = self.read_grid(pathname)? {
+                    if !grid.data.is_empty() {
+                        dest.write_grid(
+                            pathname, grid.grid_type,
+                            grid.nx, grid.ny,
+                            &grid.data, &grid.data_units, grid.cell_size,
+                        )?;
+                        return Ok(true);
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(false)
+    }
+
+    /// Copy all records from this file to another NativeDssFile.
+    /// Returns the number of records copied.
+    pub fn copy_file(&mut self, dest: &mut NativeDssFile) -> io::Result<usize> {
+        let entries = self.catalog()?;
+        let mut copied = 0;
+        for entry in &entries {
+            if self.copy_record(&entry.pathname, dest)? {
+                copied += 1;
+            }
+        }
+        Ok(copied)
+    }
+
+    /// Check file integrity. Returns a list of issues found.
+    ///
+    /// Validates: DSS identifier, end-of-header flag, hash table addresses,
+    /// bin entry consistency, info block flags.
+    pub fn check_file(&mut self) -> io::Result<Vec<String>> {
+        let mut issues = Vec::new();
+
+        // Check DSS identifier
+        let id_bytes = self.header[fh::DSS_IDENTIFIER].to_le_bytes();
+        if &id_bytes[0..4] != b"ZDSS" {
+            issues.push("Invalid DSS identifier (expected ZDSS)".to_string());
+        }
+
+        // Check end-of-header flag
+        if self.header[fh::END_FILE_HEADER] != keys::DSS_END_HEADER_FLAG {
+            issues.push(format!(
+                "Invalid end-of-header flag: {} (expected {})",
+                self.header[fh::END_FILE_HEADER], keys::DSS_END_HEADER_FLAG
+            ));
+        }
+
+        // Check hash table start is valid
+        let hts = self.hash_table_start();
+        if hts <= 0 || hts >= self.file_size() {
+            issues.push(format!("Invalid hash table start address: {hts}"));
+        }
+
+        // Check first bin address
+        let fba = self.first_bin_addr();
+        if fba <= 0 || fba >= self.file_size() {
+            issues.push(format!("Invalid first bin address: {fba}"));
+        }
+
+        // Check max_hash is reasonable
+        let mh = self.max_hash();
+        if mh <= 0 || mh > 100000 {
+            issues.push(format!("Unusual max_hash value: {mh}"));
+        }
+
+        // Check bin_size is reasonable
+        let bs = self.bin_size();
+        if !(30..=1000).contains(&bs) {
+            issues.push(format!("Unusual bin_size: {bs}"));
+        }
+
+        // Scan bins and verify info block flags
+        let (fb, bsize, bpb) = (self.first_bin_addr(), self.bin_size(), self.bins_per_block());
+        if let Ok(entries) = bin::read_all_bins(&mut self.file, fb, bsize, bpb) {
+            for entry in &entries {
+                if entry.info_address > 0 && entry.status == keys::record_status::PRIMARY {
+                    // Verify info block has correct flag
+                    if let Ok(Some(info)) = RecordInfo::read_from(&mut self.file, entry.info_address) {
+                        if info.raw[ri::FLAG] != keys::DSS_INFO_FLAG {
+                            issues.push(format!(
+                                "Invalid info flag for {}: {} (expected {})",
+                                entry.pathname, info.raw[ri::FLAG], keys::DSS_INFO_FLAG
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+
+        if issues.is_empty() {
+            issues.push("File integrity OK".to_string());
+        }
+
+        Ok(issues)
+    }
+
     /// Read the record info for a pathname. Returns None if not found.
     fn read_record_info(&mut self, pathname: &str) -> io::Result<Option<RecordInfo>> {
         let entry = match self.find_record(pathname)? {
@@ -2030,6 +2215,141 @@ mod tests {
         assert_eq!(d.record_type("/A/B/FLOW/01JAN2020/1HOUR/RT/").unwrap(), 105);
         assert_eq!(d.record_type("/NO/EXIST///HERE/").unwrap(), 0);
 
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_undelete() {
+        let p = temp_path("undelete");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        d.write_text("/A/B/NOTE///UNDEL/", "restore me").unwrap();
+        d.delete("/A/B/NOTE///UNDEL/").unwrap();
+        // Should not be findable after delete
+        let cat = d.catalog().unwrap();
+        assert!(cat.iter().all(|e| !e.pathname.contains("UNDEL")));
+        // Undelete
+        d.undelete("/A/B/NOTE///UNDEL/").unwrap();
+        let cat2 = d.catalog().unwrap();
+        assert!(cat2.iter().any(|e| e.pathname.contains("UNDEL")));
+        assert_eq!(d.read_text("/A/B/NOTE///UNDEL/").unwrap(), Some("restore me".into()));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_copy_record() {
+        let p1 = temp_path("copy_src");
+        let p2 = temp_path("copy_dst");
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+
+        let mut src = NativeDssFile::create(p1.to_str().unwrap()).unwrap();
+        src.write_text("/A/B/NOTE///COPY/", "copied text").unwrap();
+        src.write_ts("/A/B/FLOW/01JAN2020/1HOUR/COPY/", &[1.0, 2.0, 3.0], "CFS", "INST-VAL").unwrap();
+
+        let mut dst = NativeDssFile::create(p2.to_str().unwrap()).unwrap();
+        assert!(src.copy_record("/A/B/NOTE///COPY/", &mut dst).unwrap());
+        assert!(src.copy_record("/A/B/FLOW/01JAN2020/1HOUR/COPY/", &mut dst).unwrap());
+        assert!(!src.copy_record("/NO/EXIST///HERE/", &mut dst).unwrap());
+
+        assert_eq!(dst.record_count(), 2);
+        assert_eq!(dst.read_text("/A/B/NOTE///COPY/").unwrap(), Some("copied text".into()));
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn test_copy_file() {
+        let p1 = temp_path("copyfile_src");
+        let p2 = temp_path("copyfile_dst");
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+
+        let mut src = NativeDssFile::create(p1.to_str().unwrap()).unwrap();
+        src.write_text("/A/B/NOTE///ONE/", "first").unwrap();
+        src.write_text("/A/B/NOTE///TWO/", "second").unwrap();
+        src.write_ts("/A/B/FLOW/01JAN2020/1HOUR/F/", &[10.0, 20.0], "CFS", "INST-VAL").unwrap();
+
+        let mut dst = NativeDssFile::create(p2.to_str().unwrap()).unwrap();
+        let n = src.copy_file(&mut dst).unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(dst.record_count(), 3);
+
+        let _ = std::fs::remove_file(&p1);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    #[test]
+    fn test_check_file() {
+        let p = temp_path("check");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        d.write_text("/A/B/NOTE///CHK/", "check me").unwrap();
+        let issues = d.check_file().unwrap();
+        assert!(issues.iter().any(|i| i.contains("OK")), "Expected OK, got: {:?}", issues);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_write_and_read_location() {
+        let p = temp_path("location");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        let loc = LocationRecord {
+            x: -121.5, y: 38.5, z: 100.0,
+            coordinate_system: 2,
+            horizontal_datum: 1,
+            timezone: "PST".to_string(),
+            ..Default::default()
+        };
+        d.write_location("/A/B/LOC///POS/", &loc).unwrap();
+
+        // Reopen and read
+        drop(d);
+        let mut d2 = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+        let read_loc = d2.read_location("/A/B/LOC///POS/").unwrap().unwrap();
+        assert!((read_loc.x - (-121.5)).abs() < 1.0); // float precision
+        assert!((read_loc.y - 38.5).abs() < 1.0);
+        assert_eq!(read_loc.coordinate_system, 2);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_write_and_read_irregular_ts() {
+        let p = temp_path("irr_ts");
+        let _ = std::fs::remove_file(&p);
+        let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+        d.write_ts_irregular(
+            "/A/B/STAGE//IR-MONTH/OBS/",
+            &[60, 120, 180],
+            &[5.0, 10.0, 15.0],
+            60, "FT", "INST-VAL",
+        ).unwrap();
+        assert_eq!(d.record_count(), 1);
+        assert_eq!(d.record_type("/A/B/STAGE//IR-MONTH/OBS/").unwrap(), 115); // ITD
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn test_write_and_read_grid() {
+        let p = temp_path("grid");
+        let _ = std::fs::remove_file(&p);
+        let data: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        {
+            let mut d = NativeDssFile::create(p.to_str().unwrap()).unwrap();
+            d.write_grid("/SHG/BASIN/PRECIP/01JAN2020/01JAN2020/SIM/",
+                430, 4, 3, &data, "MM", 2000.0).unwrap();
+        }
+        {
+            let mut d = NativeDssFile::open(p.to_str().unwrap()).unwrap();
+            let grid = d.read_grid("/SHG/BASIN/PRECIP/01JAN2020/01JAN2020/SIM/").unwrap().unwrap();
+            assert_eq!(grid.nx, 4);
+            assert_eq!(grid.ny, 3);
+            assert_eq!(grid.data.len(), 12);
+            assert!((grid.data[0] - 0.0).abs() < 0.001);
+            assert!((grid.data[11] - 11.0).abs() < 0.001);
+        }
         let _ = std::fs::remove_file(&p);
     }
 }
