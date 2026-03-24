@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "hecdss"
+name = "hecdss-rs"
 version = "0.1.0"
 description = "Pure Rust HEC-DSS version 7 file reader/writer with Python bindings"
 readme = "README.md"
