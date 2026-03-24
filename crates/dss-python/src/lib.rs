@@ -12,7 +12,7 @@
 
 use numpy::{PyArray1, PyArrayMethods};
 use pyo3::prelude::*;
-use pyo3::exceptions::{PyIOError, PyValueError};
+use pyo3::exceptions::PyIOError;
 
 use dss_core::{NativeDssFile, LocationRecord, datetime};
 
@@ -148,6 +148,7 @@ impl DssFile {
     // --- Paired data ---
 
     /// Read paired data. Returns (ordinates, values) numpy arrays or None.
+    #[allow(clippy::type_complexity)]
     fn read_pd<'py>(&mut self, py: Python<'py>, pathname: &str,
     ) -> PyResult<Option<(Bound<'py, PyArray1<f64>>, Bound<'py, PyArray1<f64>>)>> {
         match self.get_mut()?.read_pd(pathname).map_err(io_err)? {
@@ -261,6 +262,7 @@ impl DssFile {
 
     /// Write grid data from flat float array.
     #[pyo3(signature = (pathname, grid_type, nx, ny, data, data_units="", cell_size=0.0))]
+    #[allow(clippy::too_many_arguments)]
     fn write_grid(
         &mut self, pathname: &str,
         grid_type: i32, nx: i32, ny: i32,
@@ -366,6 +368,7 @@ impl DssFile {
 
     fn __enter__(slf: Py<Self>) -> Py<Self> { slf }
 
+    #[pyo3(signature = (_exc_type=None, _exc_val=None, _exc_tb=None))]
     fn __exit__(
         &mut self,
         _exc_type: Option<Bound<'_, PyAny>>,

@@ -33,6 +33,7 @@ pub enum DssError {
 }
 
 /// Check a status code from a C function and convert to Result.
+#[cfg(feature = "c-library")]
 pub(crate) fn check_status(status: i32, context: &str) -> Result<(), DssError> {
     match status {
         0 => Ok(()),
