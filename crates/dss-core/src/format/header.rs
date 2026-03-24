@@ -83,9 +83,9 @@ impl FileHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
     #[test]
+    #[cfg(feature = "c-library")]
     fn test_read_header_from_c_created_file() {
         // Create a DSS file using the C library, then read its header in pure Rust
         let path = std::env::temp_dir().join("rust_header_test.dss");

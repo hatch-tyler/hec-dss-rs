@@ -1,26 +1,25 @@
 //! Safe Rust interface for HEC-DSS version 7 files.
 //!
-//! Provides [`DssFile`] as the main entry point for reading and writing
-//! DSS records through the C `hecdss` shared library.
+//! The primary entry point is [`NativeDssFile`] which provides pure Rust
+//! reading and writing of DSS7 files with no C library dependency.
 //!
 //! # Example
 //!
 //! ```no_run
-//! use dss_core::DssFile;
+//! use dss_core::NativeDssFile;
 //!
-//! let mut dss = DssFile::open("example.dss")?;
-//! for entry in dss.catalog(None)? {
-//!     println!("{} [type={}]", entry.pathname, entry.record_type);
-//! }
-//! dss.close();
-//! # Ok::<(), dss_core::DssError>(())
+//! let mut dss = NativeDssFile::create("example.dss")?;
+//! dss.write_text("/A/B/NOTE///V/", "Hello from Rust")?;
+//! # Ok::<(), std::io::Error>(())
 //! ```
 
 mod error;
+#[cfg(feature = "c-library")]
 mod file;
 pub mod format;
 
 pub use error::DssError;
+#[cfg(feature = "c-library")]
 pub use file::{CatalogEntry, DssFile, TimeSeriesData};
 pub use format::hash;
 pub use format::keys;

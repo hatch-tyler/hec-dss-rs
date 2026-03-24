@@ -94,30 +94,37 @@ pub fn read_v6_records(file: &mut File, header: &V6Header) -> io::Result<Vec<V6R
 
         let bin = read_i32_words(file, bin_addr, bin_size)?;
 
-        // V6 bin layout: [0]=overflow, [1]=hash, [2]=status, [3]=pathLen, [4..]=pathname
-        let status = bin[2];
-        if status != 1 { continue; } // Only read valid primary records
+        // V6 bin layout varies. Find pathname by scanning for '/' (0x2F) as first byte.
+        let mut path_start = 0;
+        let mut path_len = 0;
+        for j in 2..bin_size.min(10) {
+            let first_byte = (bin[j] & 0xFF) as u8;
+            if first_byte == b'/' {
+                // Found pathname start; pathLen is the word before
+                path_start = j;
+                path_len = bin[j - 1] as usize;
+                break;
+            }
+        }
+        if path_start == 0 || path_len == 0 || path_len > 393 { continue; }
 
-        let path_len = bin[3] as usize;
-        if path_len == 0 || path_len > 393 { continue; }
         let path_words = path_len.div_ceil(4);
-
-        if 4 + path_words >= bin_size { continue; }
+        if path_start + path_words >= bin_size { continue; }
 
         // Extract pathname
         let mut path_buf = Vec::with_capacity(path_len);
-        for &w in &bin[4..4 + path_words] {
+        for &w in &bin[path_start..path_start + path_words] {
             path_buf.extend_from_slice(&w.to_le_bytes());
         }
         path_buf.truncate(path_len);
         let pathname = String::from_utf8_lossy(&path_buf).trim().to_string();
         if !pathname.starts_with('/') { continue; }
 
-        // After pathname: info_address and metadata
-        let meta_start = 4 + path_words;
+        // After pathname: info_address is the first word after the pathname
+        let meta_start = path_start + path_words;
         let info_addr = if meta_start < bin_size { bin[meta_start] } else { 0 };
 
-        // Number of values is in the bin metadata
+        // Number of values is 2 words after info_address
         let num_values = if meta_start + 2 < bin_size { bin[meta_start + 2] } else { 0 };
         let data_type = if meta_start + 4 < bin_size { bin[meta_start + 4] } else { 100 };
 
@@ -142,45 +149,51 @@ pub fn read_v6_records(file: &mut File, header: &V6Header) -> io::Result<Vec<V6R
 }
 
 /// Read float values from a v6 record, scanning for the data start.
+///
+/// V6 records have a variable-size internal header (typically 77-81 words)
+/// before the actual float values. We scan forward looking for where valid
+/// float data begins (values between -901 and 1e6, or exactly -901/0).
 fn read_v6_values(file: &mut File, info_addr: i32, num_values: i32, file_len: i32) -> io::Result<Vec<f32>> {
-    // V6 records have an internal header of variable size before the actual values.
-    // We scan forward from info_addr to find where the float data begins.
-    // The internal header is typically 70-80 words.
-    let scan_start = info_addr;
-    let scan_end = (info_addr + 200).min(file_len);
-    if scan_start >= file_len { return Ok(Vec::new()); }
+    let scan_size = 200.min((file_len - info_addr) as usize);
+    if scan_size < 10 { return Ok(Vec::new()); }
 
-    let scan_words = read_i32_words(file, scan_start, (scan_end - scan_start) as usize)?;
+    let scan_words = read_i32_words(file, info_addr, scan_size)?;
 
-    // Look for the pattern: a run of floats that includes known v6 values
-    // Strategy: find the offset where reading `num_values` floats gives reasonable data
-    // The data section starts after the internal header, which ends with -901 patterns
-    let mut best_offset = 76; // typical offset
+    // Scan forward from around offset 70 to find where float data begins.
+    // The internal header contains integers (addresses, counts) that look like
+    // large/nonsensical values when interpreted as floats.
+    // The data section starts with valid floats: -901.0 (missing), 0.0, or small numbers.
+    let mut data_offset = None;
+    for offset in 70..scan_size.min(100) {
+        if offset + num_values as usize > scan_size { break; }
 
-    // Scan for the transition from header to data
-    for offset in (60..120).rev() {
-        if offset + 2 >= scan_words.len() { continue; }
-        let f1 = f32::from_le_bytes(scan_words[offset].to_le_bytes());
-        let f2 = f32::from_le_bytes(scan_words[offset + 1].to_le_bytes());
-        // Check if this looks like V6 missing (-901) followed by data or more missing
-        if (f1 == V6_MISSING || f1 == 0.0 || (f1.abs() < 1e6 && f1.abs() > 0.0))
-            && (f2 == V6_MISSING || f2 == 0.0 || (f2.abs() < 1e6 && f2.abs() > 0.0))
-        {
-            best_offset = offset;
+        // Check if this offset starts a run of valid floats
+        let f = f32::from_le_bytes(scan_words[offset].to_le_bytes());
+        let f_next = if offset + 1 < scan_size {
+            f32::from_le_bytes(scan_words[offset + 1].to_le_bytes())
+        } else { 0.0 };
+
+        let is_valid = |v: f32| v == V6_MISSING || v == 0.0 || (v.is_finite() && v.abs() < 1e6);
+
+        if is_valid(f) && is_valid(f_next) {
+            data_offset = Some(offset);
             break;
         }
     }
 
-    // Read num_values floats from the best offset
-    let data_addr = info_addr + best_offset as i32;
+    let offset = match data_offset {
+        Some(o) => o,
+        None => return Ok(Vec::new()),
+    };
+
+    // Read num_values floats
+    let data_addr = info_addr + offset as i32;
     if data_addr + num_values > file_len { return Ok(Vec::new()); }
 
     let data_words = read_i32_words(file, data_addr, num_values as usize)?;
-    let values: Vec<f32> = data_words.iter()
+    Ok(data_words.iter()
         .map(|&w| f32::from_le_bytes(w.to_le_bytes()))
-        .collect();
-
-    Ok(values)
+        .collect())
 }
 
 /// Convert v6 missing values (-901.0) to v7 missing values (-3.4e38).
@@ -290,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires C:\temp\TSDATA_IN_v6.DSS; v6 parsing is experimental
+    #[cfg_attr(not(target_os = "windows"), ignore)] // Requires C:\temp\TSDATA_IN_v6.DSS
     fn test_read_v6_records() {
         if let Ok(mut file) = File::open("C:/temp/TSDATA_IN_v6.DSS") {
             let header = read_v6_header(&mut file).unwrap();
@@ -315,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Requires both C:\temp\TSDATA_IN_v6.DSS and v7.DSS; v6 parsing is experimental
+    #[cfg_attr(not(target_os = "windows"), ignore)] // Requires C:\temp\TSDATA_IN_v6.DSS + v7.DSS
     fn test_v6_data_matches_v7_reference() {
         let v6_path = "C:/temp/TSDATA_IN_v6.DSS";
         let v7_path = "C:/temp/TSDATA_IN_v7.DSS";
@@ -338,22 +351,31 @@ mod tests {
         let mut v7 = crate::NativeDssFile::open(v7_path).unwrap();
         let v7_cat = v7.catalog().unwrap();
 
-        // Compare pathnames
+        // Compare record counts
         assert_eq!(v6_records.len(), v7_cat.len(), "Record count mismatch");
+
+        // Compare pathnames (DSSVue may expand abbreviations like "1MON"->"1Month")
+        // Compare by B-part and C-part (location + parameter) which are stable
         for v6_rec in &v6_records {
-            let v6_upper = v6_rec.pathname.to_uppercase();
+            let v6_parts: Vec<&str> = v6_rec.pathname.split('/').collect();
+            let v6_b = v6_parts.get(2).unwrap_or(&"");
+            let v6_c = v6_parts.get(3).unwrap_or(&"");
             assert!(
-                v7_cat.iter().any(|e| e.pathname.to_uppercase() == v6_upper),
-                "V6 pathname {} not found in v7 reference",
-                v6_rec.pathname,
+                v7_cat.iter().any(|e| {
+                    let parts: Vec<&str> = e.pathname.split('/').collect();
+                    let b = parts.get(2).unwrap_or(&"");
+                    let c = parts.get(3).unwrap_or(&"");
+                    b.eq_ignore_ascii_case(v6_b) && c.eq_ignore_ascii_case(v6_c)
+                }),
+                "V6 record {}/{} not found in v7 reference",
+                v6_b, v6_c,
             );
         }
 
         // Compare data values for GAGE1
         if let Some(v6_gage1) = v6_records.iter().find(|r| r.pathname.contains("GAGE1")) {
-            let v7_ts = v7.read_ts(
-                &v7_cat.iter().find(|e| e.pathname.contains("GAGE1")).unwrap().pathname
-            ).unwrap().unwrap();
+            let v7_pn = &v7_cat.iter().find(|e| e.pathname.contains("GAGE1")).unwrap().pathname;
+            let v7_ts = v7.read_ts(v7_pn).unwrap().unwrap();
 
             // Convert v6 missing to v7 missing for comparison
             let v6_converted = convert_missing_values(&v6_gage1.values);

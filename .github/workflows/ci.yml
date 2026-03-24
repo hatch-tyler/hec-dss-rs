@@ -37,12 +37,12 @@ jobs:
           cmake --build hec-dss-c/build --config Release --target hecdss
 
       - name: Build workspace
-        run: cargo build --release
+        run: cargo build --all-features --release
         env:
           HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
 
       - name: Run all tests
-        run: cargo test --release
+        run: cargo test --all-features --release
         env:
           HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
           PATH: ${{ github.workspace }}/hec-dss-c/build/heclib/hecdss/Release;${{ env.PATH }}
@@ -71,11 +71,11 @@ jobs:
             target
           key: ${{ matrix.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build dss-core and dss-ffi
-        run: cargo build -p dss-core -p dss-ffi --release
+      - name: Build dss-core and dss-ffi (no C dependency)
+        run: cargo build -p dss-core -p dss-ffi --release --no-default-features
 
-      - name: Run dss-core unit tests
-        run: cargo test -p dss-core --lib
+      - name: Run dss-core unit tests (no C dependency)
+        run: cargo test -p dss-core --lib --no-default-features
 
       - name: Upload shared library
         uses: actions/upload-artifact@v4

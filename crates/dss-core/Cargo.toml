@@ -9,10 +9,14 @@ keywords = ["hec-dss", "hydrology", "dss", "usace", "water-resources"]
 categories = ["science", "parser-implementations"]
 
 [dependencies]
-dss-sys = { path = "../dss-sys" }
+dss-sys = { path = "../dss-sys", optional = true }
 thiserror = "2"
 fs2 = "0.4"
 flate2 = "1"
+
+[features]
+default = []
+c-library = ["dss-sys"]
 
 [dev-dependencies]
 criterion = "0.5"

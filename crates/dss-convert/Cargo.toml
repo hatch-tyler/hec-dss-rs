@@ -10,5 +10,5 @@ name = "dss-convert"
 path = "src/main.rs"
 
 [dependencies]
-dss-core = { path = "../dss-core" }
+dss-core = { path = "../dss-core", features = ["c-library"] }
 dss-sys = { path = "../dss-sys" }
