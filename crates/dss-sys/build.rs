@@ -2,7 +2,7 @@ use std::env;
 
 fn main() {
     let hec_dss_dir = env::var("HEC_DSS_DIR")
-        .unwrap_or_else(|_| "C:/temp/hec-dss-1".to_string());
+        .expect("HEC_DSS_DIR environment variable must be set to the hec-dss source directory");
 
     let lib_dir = env::var("HEC_DSS_LIB_DIR").unwrap_or_else(|_| {
         format!("{}/build/heclib/hecdss/Release", hec_dss_dir)

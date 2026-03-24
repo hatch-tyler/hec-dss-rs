@@ -7,9 +7,10 @@ license.workspace = true
 repository = "https://github.com/hatch-tyler/hec-dss-rs"
 keywords = ["hec-dss", "hydrology", "dss", "usace", "water-resources"]
 categories = ["science", "parser-implementations"]
+exclude = ["tests/cross_validate.rs", "tests/integration.rs"]
 
 [dependencies]
-dss-sys = { path = "../dss-sys", optional = true }
+dss-sys = { path = "../dss-sys", version = "0.1.0", optional = true }
 thiserror = "2"
 fs2 = "0.4"
 flate2 = "1"

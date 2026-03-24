@@ -4,9 +4,12 @@ description = "C-compatible FFI export for HEC-DSS, drop-in replacement for hecd
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository = "https://github.com/hatch-tyler/hec-dss-rs"
+keywords = ["hec-dss", "hydrology", "ffi", "usace"]
+categories = ["science", "external-ffi-bindings"]
 
 [lib]
 crate-type = ["cdylib", "staticlib"]
 
 [dependencies]
-dss-core = { path = "../dss-core" }
+dss-core = { path = "../dss-core", version = "0.1.0" }

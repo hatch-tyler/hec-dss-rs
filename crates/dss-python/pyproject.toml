@@ -1,0 +1,37 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "hecdss"
+version = "0.1.0"
+description = "Pure Rust HEC-DSS version 7 file reader/writer with Python bindings"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.9"
+authors = [{name = "Tyler Hatch"}]
+keywords = ["hec-dss", "hydrology", "dss", "usace", "water-resources", "hec-ras", "hec-hms"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Hydrology",
+]
+dependencies = ["numpy"]
+
+[project.urls]
+Homepage = "https://github.com/hatch-tyler/hec-dss-rs"
+Documentation = "https://hatch-tyler.github.io/hec-dss-rs/"
+Repository = "https://github.com/hatch-tyler/hec-dss-rs"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "hecdss_rs"

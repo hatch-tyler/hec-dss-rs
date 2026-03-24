@@ -4,6 +4,7 @@ description = "DSS v6 to v7 conversion tool"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 [[bin]]
 name = "dss-convert"
