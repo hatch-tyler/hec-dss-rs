@@ -1,39 +1,58 @@
 # Changelog
 
-## 0.1.0 (2026-03-23)
+## 0.1.0 (2026-03-24)
 
 ### Initial Release
 
-**dss-core** - Pure Rust DSS7 engine:
-- `NativeDssFile`: open, create, catalog, record_count
-- Text records: read_text, write_text
-- Time series: read_ts, write_ts (regular, double precision)
-- Paired data: read_pd, write_pd (double precision)
-- File format: hash algorithm, header reading, bin traversal, record info parsing
-- Bin block overflow (automatic allocation of new blocks)
-- Pathname validation (format, length, null bytes)
-- Input validation on all write operations
-- Cross-validated with C library in both directions
+#### dss-core — Pure Rust DSS7 Engine (37 public methods)
 
-**dss-ffi** - Drop-in DLL replacement:
-- All `hec_dss_*` functions matching `hecdss.h`
-- Thread-safe (Mutex per handle)
-- No panic paths (all errors return status codes)
-- 200 KB (vs 705 KB for C version)
+**File Operations:** open, create, record_count, record_type, catalog, catalog_filtered
 
-**dss-python** - PyO3 native Python module:
-- `hecdss_rs.DssFile` with context manager
-- NumPy array support for time series and paired data
-- Zero C dependency
+**Text Records:** read_text, write_text
 
-**dss-fortran** - Fortran interop:
-- `hecdss_mod.f90` with ISO_C_BINDING interfaces
-- Verified with Intel ifx 2025.3 (10/10 tests pass)
+**Time Series:** read_ts, write_ts, write_ts_irregular, read_ts_window, write_ts_multi, ts_get_sizes, ts_retrieve_info, ts_get_date_time_range
 
-**dss-sys** - Raw FFI bindings to C library (for testing)
+**Paired Data:** read_pd, write_pd, pd_retrieve_info
+
+**Array Records:** read_array, write_array
+
+**Location Data:** read_location, write_location
+
+**Grid/Spatial:** read_grid, write_grid (with zlib compression)
+
+**Record Management:** delete, undelete, squeeze, copy_record, copy_file, check_file
+
+**Aliases:** alias_add, alias_remove, alias_list
+
+**CRC/Change Tracking:** get_data_crc, snapshot_crcs, what_changed
+
+**Date/Time:** date_to_julian, julian_to_ymd, parse_date, parse_interval, generate_block_starts, values_in_block
+
+**V6 Support:** detect_version, read_v6_header, read_v6_records, scan_v7_records (brute-force)
+
+#### dss-ffi — Drop-in C DLL Replacement (40/40 hecdss.h functions)
+
+All `hec_dss_*` functions implemented. 200 KB DLL, zero C dependencies. Thread-safe via mutex per handle.
+
+#### dss-python — PyO3 Native Python Module (35+ methods)
+
+All NativeDssFile operations available from Python with NumPy array support, context manager, static date utility methods.
+
+#### dss-fortran — Fortran Interop
+
+ISO_C_BINDING module with interfaces for all `hec_dss_*` functions. Verified with Intel ifx 2025.3 (10/10 tests).
+
+#### dss-convert — CLI Conversion Tool
+
+v6-to-v7 conversion and v7 file compaction.
+
+#### dss-sys — C Library FFI Bindings
+
+Raw unsafe bindings to the original C `hecdss` library. Used for cross-validation testing only.
 
 ### Testing
-- 62 Rust tests (unit + integration + cross-validation + property-based)
+
+- 96 Rust tests (unit + integration + cross-validation + property-based)
 - 10 Fortran tests
 - Python integration verified
-- Cross-language interop: Rust <-> C, Rust <-> Python, Fortran -> Rust -> Python
+- CI: Ubuntu, Windows, macOS + Python wheels (all green)
