@@ -44,8 +44,8 @@ jobs:
         env:
           HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
 
-      - name: Run all tests
-        run: cargo test --all-features --release
+      - name: Run all tests (single-threaded to avoid C library handle exhaustion)
+        run: cargo test --all-features --release -- --test-threads=1
         env:
           HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
 
