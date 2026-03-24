@@ -184,7 +184,7 @@ pub unsafe extern "C" fn hec_dss_catalog(
     dss: *mut DssFileHandle,
     path_buffer: *mut c_char,
     record_types: *mut c_int,
-    _path_filter: *const c_char,
+    path_filter: *const c_char,
     count: c_int,
     path_buffer_item_size: c_int,
 ) -> c_int {
@@ -194,7 +194,11 @@ pub unsafe extern "C" fn hec_dss_catalog(
     }
     let handle = &*dss;
     let mut file = lock_or_fail!(handle);
-    let entries = match file.catalog() {
+    let filter = if path_filter.is_null() { None } else {
+        let s = cstr_to_str(path_filter);
+        if s.is_empty() { None } else { Some(s) }
+    };
+    let entries = match file.catalog_filtered(filter) {
         Ok(e) => e,
         Err(_) => return -1,
     };

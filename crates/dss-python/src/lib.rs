@@ -56,8 +56,10 @@ impl DssFile {
     // --- Catalog ---
 
     /// Return catalog entries as list of (pathname, record_type) tuples.
-    fn catalog(&mut self) -> PyResult<Vec<(String, i32)>> {
-        let entries = self.get_mut()?.catalog().map_err(io_err)?;
+    /// Optional filter uses wildcard pattern (e.g., "/BASIN/*/FLOW///*/").
+    #[pyo3(signature = (filter=None))]
+    fn catalog(&mut self, filter: Option<&str>) -> PyResult<Vec<(String, i32)>> {
+        let entries = self.get_mut()?.catalog_filtered(filter).map_err(io_err)?;
         Ok(entries.into_iter().map(|e| (e.pathname, e.record_type)).collect())
     }
 

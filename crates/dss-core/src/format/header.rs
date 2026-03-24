@@ -18,6 +18,14 @@ impl FileHeader {
     /// Detects endianness by checking the DSS identifier. If the file was
     /// written on a big-endian system, all i64 words are byte-swapped.
     pub fn read_from(file: &mut File) -> io::Result<Self> {
+        // Validate minimum file size
+        let file_len = file.seek(SeekFrom::End(0))?;
+        if file_len < (fh::HEADER_SIZE * 8) as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("File too small for DSS7 header ({file_len} bytes, need {})", fh::HEADER_SIZE * 8),
+            ));
+        }
         file.seek(SeekFrom::Start(0))?;
 
         let mut buf = vec![0u8; fh::HEADER_SIZE * 8];

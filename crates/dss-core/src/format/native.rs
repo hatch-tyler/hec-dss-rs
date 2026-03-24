@@ -141,6 +141,36 @@ fn crc32(data: &[u8]) -> u32 {
     !crc
 }
 
+/// Parse a wildcard filter pattern into parts. Each part is a filter for A-F.
+fn parse_wildcard_filter(filter: &str) -> Vec<String> {
+    filter.trim_matches('/')
+        .split('/')
+        .map(|s| s.to_uppercase())
+        .collect()
+}
+
+/// Check if a pathname matches a wildcard filter.
+/// `*` in a filter part matches anything. Empty filter part matches empty pathname part.
+fn matches_wildcard(pathname: &str, filter_parts: &[String]) -> bool {
+    let path_parts: Vec<&str> = pathname.trim_matches('/').split('/').collect();
+    for (i, filter_part) in filter_parts.iter().enumerate() {
+        if filter_part == "*" { continue; }
+        let path_part = path_parts.get(i).unwrap_or(&"");
+        if filter_part.starts_with('*') && filter_part.ends_with('*') && filter_part.len() > 2 {
+            // *FLOW* matches anything containing FLOW
+            let inner = &filter_part[1..filter_part.len()-1];
+            if !path_part.to_uppercase().contains(inner) { return false; }
+        } else if let Some(suffix) = filter_part.strip_prefix('*') {
+            if !path_part.to_uppercase().ends_with(suffix) { return false; }
+        } else if filter_part.ends_with('*') {
+            let prefix = &filter_part[..filter_part.len()-1];
+            if !path_part.to_uppercase().starts_with(prefix) { return false; }
+        } else if !filter_part.is_empty()
+            && path_part.to_uppercase() != *filter_part { return false; }
+    }
+    true
+}
+
 fn current_time_millis() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -289,11 +319,25 @@ impl NativeDssFile {
     pub fn record_count(&self) -> i64 { self.header[fh::NUMBER_RECORDS] }
 
     pub fn catalog(&mut self) -> io::Result<Vec<CatalogEntry>> {
+        self.catalog_filtered(None)
+    }
+
+    /// Build a catalog with optional wildcard filtering.
+    ///
+    /// Filter format: `/A/B/C/D/E/F/` where `*` matches any string in a part.
+    /// Example: `"/BASIN/*/FLOW///*/"`
+    pub fn catalog_filtered(&mut self, filter: Option<&str>) -> io::Result<Vec<CatalogEntry>> {
         let (fb, bs, bpb) = (self.first_bin_addr(), self.bin_size(), self.bins_per_block());
         let entries = bin::read_all_bins(&mut self.file, fb, bs, bpb)?;
+        let filter_parts = filter.map(parse_wildcard_filter);
+
         Ok(entries.into_iter()
             .filter(|e| e.status == keys::record_status::PRIMARY
                      || e.status == keys::record_status::ALIAS)
+            .filter(|e| match &filter_parts {
+                Some(parts) => matches_wildcard(&e.pathname, parts),
+                None => true,
+            })
             .map(|e| CatalogEntry { pathname: e.pathname, record_type: e.data_type, status: e.status })
             .collect())
     }

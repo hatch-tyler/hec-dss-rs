@@ -1,3 +1,5 @@
+#![cfg(feature = "c-library")]
+
 use dss_core::{DssFile, DssError};
 use std::path::PathBuf;
 

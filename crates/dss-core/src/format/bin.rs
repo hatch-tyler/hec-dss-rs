@@ -48,8 +48,17 @@ pub fn read_all_bins(
 ) -> io::Result<Vec<BinEntry>> {
     let mut entries = Vec::new();
     let mut block_address = first_bin_address;
+    let mut iterations = 0;
+    const MAX_ITERATIONS: usize = 10000; // Guard against corrupt overflow chains
 
     while block_address > 0 {
+        iterations += 1;
+        if iterations > MAX_ITERATIONS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Bin chain exceeded maximum iterations (possible circular reference)",
+            ));
+        }
         // Read the entire bin block plus overflow pointer
         let block_words = (bin_size as usize) * (bins_per_block as usize) + 1;
         let block = dss_io::read_words(file, block_address, block_words)?;

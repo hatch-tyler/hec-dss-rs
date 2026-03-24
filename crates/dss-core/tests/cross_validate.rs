@@ -1,3 +1,4 @@
+#![cfg(feature = "c-library")]
 //! Cross-validation tests: verify pure Rust format code matches C library output.
 
 use dss_core::format::hash;
