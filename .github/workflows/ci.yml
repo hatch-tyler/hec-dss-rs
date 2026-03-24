@@ -36,6 +36,9 @@ jobs:
           cmake -S hec-dss-c -B hec-dss-c/build
           cmake --build hec-dss-c/build --config Release --target hecdss
 
+      - name: Add DLL to PATH
+        run: echo "${{ github.workspace }}/hec-dss-c/build/heclib/hecdss/Release" >> $env:GITHUB_PATH
+
       - name: Build workspace
         run: cargo build --all-features --release
         env:
@@ -45,7 +48,6 @@ jobs:
         run: cargo test --all-features --release
         env:
           HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
-          PATH: ${{ github.workspace }}/hec-dss-c/build/heclib/hecdss/Release;${{ env.PATH }}
 
       - name: Upload Windows DLL
         uses: actions/upload-artifact@v4
