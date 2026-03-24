@@ -1,0 +1,113 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-libs:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            lib: libdss_ffi.so
+            static_lib: libdss_ffi.a
+            asset_suffix: linux-x64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            lib: libdss_ffi.dylib
+            static_lib: libdss_ffi.a
+            asset_suffix: macos-x64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            lib: libdss_ffi.dylib
+            static_lib: libdss_ffi.a
+            asset_suffix: macos-arm64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            lib: dss_ffi.dll
+            static_lib: dss_ffi.lib
+            asset_suffix: windows-x64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build -p dss-core -p dss-ffi --release --target ${{ matrix.target }}
+
+      - name: Package assets
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/${{ matrix.lib }} dist/
+          if [ -f target/${{ matrix.target }}/release/${{ matrix.static_lib }} ]; then
+            cp target/${{ matrix.target }}/release/${{ matrix.static_lib }} dist/
+          fi
+          # Windows import lib
+          if [ -f target/${{ matrix.target }}/release/dss_ffi.dll.lib ]; then
+            cp target/${{ matrix.target }}/release/dss_ffi.dll.lib dist/dss_ffi_import.lib
+          fi
+          cp crates/dss-fortran/src/hecdss_mod.f90 dist/
+          cd dist && tar czf ../dss-ffi-${{ matrix.asset_suffix }}.tar.gz *
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload ${{ github.event.release.tag_name }} dss-ffi-${{ matrix.asset_suffix }}.tar.gz --clobber
+
+  build-wheels:
+    name: Python Wheel (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            maturin_target: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            maturin_target: "--target x86_64-apple-darwin"
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            maturin_target: "--target aarch64-apple-darwin"
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            maturin_target: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install maturin
+        run: pip install maturin
+      - name: Build wheel
+        run: maturin build --release -m crates/dss-python/Cargo.toml ${{ matrix.maturin_target }}
+      - name: Upload wheels to release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for whl in target/wheels/*.whl; do
+            gh release upload ${{ github.event.release.tag_name }} "$whl" --clobber
+          done
