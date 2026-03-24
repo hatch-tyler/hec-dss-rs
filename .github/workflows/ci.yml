@@ -44,8 +44,18 @@ jobs:
         env:
           HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
 
-      - name: Run all tests (single-threaded to avoid C library handle exhaustion)
-        run: cargo test --all-features --release -- --test-threads=1
+      - name: Run pure Rust tests
+        run: cargo test -p dss-core --lib --all-features --release
+        env:
+          HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
+
+      - name: Run cross-validation tests
+        run: cargo test -p dss-core --test cross_validate --all-features --release -- --test-threads=1
+        env:
+          HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
+
+      - name: Run dss-sys tests
+        run: cargo test -p dss-sys --release -- --test-threads=1
         env:
           HEC_DSS_DIR: ${{ github.workspace }}/hec-dss-c
 
