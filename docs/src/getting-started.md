@@ -11,7 +11,21 @@ dss-core = { git = "https://github.com/hatch-tyler/hec-dss-rs" }
 
 ## Python
 
-Build and install the PyO3 wheel:
+### From PyPI (recommended)
+
+```bash
+pip install hecdss-rs
+```
+
+### From GitHub Release
+
+Download a pre-built wheel from the [Releases page](https://github.com/hatch-tyler/hec-dss-rs/releases) and install it:
+
+```bash
+pip install hecdss_rs-<version>-<platform>.whl
+```
+
+### From Source
 
 ```bash
 cd crates/dss-python
@@ -20,7 +34,7 @@ maturin build --release
 pip install target/wheels/dss_python-*.whl
 ```
 
-Then in Python:
+### Verify
 
 ```python
 import hecdss_rs
